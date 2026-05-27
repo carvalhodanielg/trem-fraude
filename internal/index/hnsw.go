@@ -6,6 +6,8 @@ import (
 	"log"
 	"math"
 	"os"
+	"runtime"
+	"sync"
 	"time"
 )
 
@@ -111,51 +113,99 @@ type neighbor struct {
 }
 
 func (idx *Index) Search(query []float32, k int) float32 {
-	// quantiza a query uma vez antes do loop
+	// quantiza a query uma vez
 	qVec := make([]uint8, dims)
 	for i, f := range query {
 		qVec[i] = quantize(f)
 	}
 
-	worst := float32(math.MaxFloat32)
-	neighbors := make([]neighbor, 0, k)
+	numWorkers := runtime.GOMAXPROCS(0)
+	chunkSize := idx.count / numWorkers
 
-	for i := 0; i < idx.count; i++ {
-		vec := idx.vectors[i*dims : i*dims+dims]
-		d := euclidean(qVec, vec)
+	type result struct {
+		neighbors []neighbor
+	}
 
-		if len(neighbors) < k {
-			neighbors = append(neighbors, neighbor{d, idx.labels[i]})
-			if len(neighbors) == k {
-				worst = 0
-				for _, n := range neighbors {
-					if n.dist > worst {
-						worst = n.dist
+	results := make([]result, numWorkers)
+	var wg sync.WaitGroup
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+
+			start := workerID * chunkSize
+			end := start + chunkSize
+			if workerID == numWorkers-1 {
+				end = idx.count // último worker pega o resto
+			}
+
+			worst := float32(math.MaxFloat32)
+			neighbors := make([]neighbor, 0, k)
+
+			for i := start; i < end; i++ {
+				vec := idx.vectors[i*dims : i*dims+dims]
+				d := euclidean(qVec, vec)
+
+				if len(neighbors) < k {
+					neighbors = append(neighbors, neighbor{d, idx.labels[i]})
+					if len(neighbors) == k {
+						worst = 0
+						for _, n := range neighbors {
+							if n.dist > worst {
+								worst = n.dist
+							}
+						}
+					}
+					continue
+				}
+
+				if d < worst {
+					worstIdx := 0
+					for j, n := range neighbors {
+						if n.dist > neighbors[worstIdx].dist {
+							worstIdx = j
+						}
+					}
+					neighbors[worstIdx] = neighbor{d, idx.labels[i]}
+					worst = 0
+					for _, n := range neighbors {
+						if n.dist > worst {
+							worst = n.dist
+						}
 					}
 				}
 			}
-			continue
-		}
 
-		if d < worst {
+			results[workerID] = result{neighbors}
+		}(w)
+	}
+
+	wg.Wait()
+
+	// merge dos resultados de todos os workers
+	final := make([]neighbor, 0, k)
+	for _, r := range results {
+		for _, n := range r.neighbors {
+			if len(final) < k {
+				final = append(final, n)
+				continue
+			}
+			// acha o pior no final
 			worstIdx := 0
-			for j, n := range neighbors {
-				if n.dist > neighbors[worstIdx].dist {
+			for j, fn := range final {
+				if fn.dist > final[worstIdx].dist {
 					worstIdx = j
 				}
 			}
-			neighbors[worstIdx] = neighbor{d, idx.labels[i]}
-			worst = 0
-			for _, n := range neighbors {
-				if n.dist > worst {
-					worst = n.dist
-				}
+			if n.dist < final[worstIdx].dist {
+				final[worstIdx] = n
 			}
 		}
 	}
 
 	var fraudCount float32
-	for _, n := range neighbors {
+	for _, n := range final {
 		if n.label == 1 {
 			fraudCount++
 		}
