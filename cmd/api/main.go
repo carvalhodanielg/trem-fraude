@@ -53,7 +53,7 @@ func startup() {
 	}
 	riskPtr.Store(&mccRisk)
 
-	idx, err := index.Load("resources/references.json.gz")
+	idx, err := index.Load("resources/index.bin")
 	if err != nil {
 		log.Fatalf("erro ao carregar índice: %v", err)
 	}
