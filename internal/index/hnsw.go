@@ -222,6 +222,29 @@ func distSq(a *[dim]int8, b []int8) int32 {
 	return sum
 }
 
+// distSqFloat calcula a distância euclidiana ao quadrado entre a query float32
+// original e um vetor de referência int8 (promovido para float32).
+// Usada no rerank pós-search para precisão máxima sem custo de memória extra.
+// Sentinela: query[i] < 0 → ambos sentinela: contribui 0; só um: contribui 1.0
+// (equivalente a 127/127 em escala normalizada, sem o 127² do int8).
+func distSqFloat(query []float32, ref []int8) float32 {
+	var sum float32
+	const scale = 1.0 / 127.0
+	for i := 0; i < dim; i++ {
+		qi := query[i]
+		ri := float32(ref[i]) * scale
+		if qi < 0 || ref[i] < 0 {
+			if !(qi < 0 && ref[i] < 0) {
+				sum += 1.0 // penalidade máxima para sentinela misto
+			}
+			continue
+		}
+		d := qi - ri
+		sum += d * d
+	}
+	return sum
+}
+
 // upperPos encontra a posição de nodeIdx em ul.nodes via busca binária.
 // Retorna −1 se não encontrado.
 func upperPos(ul *upperLayer, nodeIdx int) int {
@@ -381,10 +404,13 @@ func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int, hb *heapBufs) []
 // Search encontra os k vizinhos mais próximos de query e retorna a fração
 // de vizinhos fraudulentos (fraud score em [0.0, 1.0]).
 //
-// Usa busca adaptativa em dois estágios com k=5 e threshold=0.6:
-// - Estágio 1 (ef=efFast): rápido para casos claros (score ∈ {0.0, 0.2, 0.8, 1.0})
-// - Estágio 2 (ef=efSearch): refino apenas para casos limítrofes (score ∈ {0.4, 0.6})
-// Os valores 2 e 3 abaixo são específicos para k=5; ajustar se k mudar.
+// Pipeline de 3 fases:
+//  1. Estágio 1 (ef=efFast): busca int8 rápida.
+//  2. Estágio 2 (ef=efSearch): apenas se resultado for limítrofe (2 ou 3 de k=5).
+//  3. Rerank float32: recalcula distâncias dos k candidatos com a query
+//     original (float32), antes da quantização int8. Corrige o erro de
+//     arredondamento da quantização e melhora o recall, especialmente nos
+//     casos em que vizinhos estão a distâncias muito próximas.
 func (idx *Index) Search(query []float32, k int) float32 {
 	q := quantizeQuery(query)
 	ep := idx.entry
@@ -401,6 +427,8 @@ func (idx *Index) Search(query []float32, k int) float32 {
 
 	// Estágio 1: busca rápida com efFast
 	results := idx.beamSearchL0(ep, &q, efFast, k, hb)
+
+	// Contagem inicial pós stage-1
 	var fraudCount int
 	for _, r := range results {
 		if idx.labels[r.idx] == 1 {
@@ -410,17 +438,54 @@ func (idx *Index) Search(query []float32, k int) float32 {
 
 	// Retorno antecipado para casos claramente aprovados ou rejeitados.
 	// Com k=5 e threshold=0.6: limítrofes são 2/5 (0.4) e 3/5 (0.6).
-	// Refinar apenas esses dois casos minimiza o custo do stage 2.
 	if fraudCount != 2 && fraudCount != 3 {
-		return float32(fraudCount) / float32(k)
+		// Rerank float32 mesmo em casos claros: reconstrói com precisão
+		// máxima os k vizinhos (custo: k=5 chamadas a distSqFloat — trivial).
+		return idx.rerankFloat(query, results, k)
 	}
 
 	// Estágio 2: refina resultado limítrofe com ef maior.
-	// hb.cands e hb.res são resetados no início da chamada — sem alocações.
 	results = idx.beamSearchL0(ep, &q, efSearch, k, hb)
-	fraudCount = 0
-	for _, r := range results {
-		if idx.labels[r.idx] == 1 {
+	return idx.rerankFloat(query, results, k)
+}
+
+// rerankFloat recalcula as distâncias dos candidatos usando a query float32
+// original (sem quantização) e devolve a fração de fraudes entre os k mais próximos.
+// Custo: k=5 chamadas a distSqFloat + insertion sort O(k²=25) — negligível vs. beam search.
+func (idx *Index) rerankFloat(query []float32, results []cand, k int) float32 {
+	n := len(results)
+	if n == 0 {
+		return 0
+	}
+	if n > k {
+		n = k
+	}
+
+	// Recalcula distâncias em float32 (query original, sem erro de quantização).
+	// ranked é stack-allocated: k=5 entradas, zero heap.
+	type rankCand struct {
+		nodeIdx int
+		d       float32
+	}
+	var ranked [5]rankCand
+	for i := 0; i < n; i++ {
+		ranked[i] = rankCand{results[i].idx, distSqFloat(query, idx.vecAt(results[i].idx))}
+	}
+
+	// Insertion sort para n=5: O(k²)=O(25) — mais rápido que qualquer sort.Slice.
+	for i := 1; i < n; i++ {
+		x := ranked[i]
+		j := i - 1
+		for j >= 0 && ranked[j].d > x.d {
+			ranked[j+1] = ranked[j]
+			j--
+		}
+		ranked[j+1] = x
+	}
+
+	fraudCount := 0
+	for i := 0; i < n; i++ {
+		if idx.labels[ranked[i].nodeIdx] == 1 {
 			fraudCount++
 		}
 	}
