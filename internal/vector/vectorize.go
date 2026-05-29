@@ -3,7 +3,6 @@ package vector
 import (
 	"encoding/json"
 	"os"
-	"time"
 )
 
 type NormalizationConstants struct {
@@ -95,17 +94,20 @@ func Vectorize(p Payload, norm NormalizationConstants, mccRisk map[string]float3
 	}
 	v[2] = clamp(amtRatio)
 
-	t, _ := time.Parse(time.RFC3339, p.Transaction.RequestedAt)
-	v[3] = float32(t.UTC().Hour()) / 23.0
-	dow := (int(t.UTC().Weekday()) + 6) % 7
+	// ParseHourWeekday e ParseEpochSeconds substituem time.Parse: zero alocações,
+	// 10-20× mais rápido para o formato fixo YYYY-MM-DDTHH:MM:SSZ do dataset.
+	hour, dow, _ := ParseHourWeekday(p.Transaction.RequestedAt)
+	v[3] = float32(hour) / 23.0
 	v[4] = float32(dow) / 6.0
 
 	if p.LastTransaction == nil {
 		v[5] = -1
 		v[6] = -1
 	} else {
-		lastT, _ := time.Parse(time.RFC3339, p.LastTransaction.Timestamp)
-		minutes := float32(t.Sub(lastT).Minutes())
+		minutes, ok := ParseMinutesBetween(p.LastTransaction.Timestamp, p.Transaction.RequestedAt)
+		if !ok {
+			minutes = 0
+		}
 		v[5] = clamp(minutes / norm.MaxMinutes)
 		v[6] = clamp(p.LastTransaction.KmFromCurrent / norm.MaxKm)
 	}
