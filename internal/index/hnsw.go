@@ -7,7 +7,6 @@
 package index
 
 import (
-	"container/heap"
 	"encoding/binary"
 	"log"
 	"time"
@@ -293,40 +292,106 @@ func (idx *Index) greedyDescend(ul *upperLayer, ep int, q *[dim]int8) int {
 	return best
 }
 
-// ── Heaps para o beam search ──────────────────────────────────────────────
+// ── Heaps inline para o beam search (sem container/heap, sem boxing) ─────────
+//
+// Todas as operações são sobre []cand diretamente — sem interface{}, sem boxing,
+// sem dispatch dinâmico. O compilador pode inlinar e vetorizar.
+//
+// minHeap: menor distância no topo (candidatos a explorar).
+// maxHeap: maior distância no topo (janela dos ef melhores resultados).
 
 type cand struct {
 	idx int
 	d   int32
 }
 
-// minCandHeap: menor distância no topo (candidatos a explorar).
-type minCandHeap []cand
+// ── minHeap (candidatos) ──────────────────────────────────────────────────────
 
-func (h minCandHeap) Len() int            { return len(h) }
-func (h minCandHeap) Less(i, j int) bool { return h[i].d < h[j].d }
-func (h minCandHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *minCandHeap) Push(x any)        { *h = append(*h, x.(cand)) }
-func (h *minCandHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[:n-1]
+func minHeapUp(h []cand, i int) {
+	for i > 0 {
+		parent := (i - 1) >> 1
+		if h[parent].d <= h[i].d {
+			break
+		}
+		h[parent], h[i] = h[i], h[parent]
+		i = parent
+	}
+}
+
+func minHeapDown(h []cand, i, n int) {
+	for {
+		left := (i << 1) + 1
+		if left >= n {
+			break
+		}
+		j := left
+		if right := left + 1; right < n && h[right].d < h[left].d {
+			j = right
+		}
+		if h[i].d <= h[j].d {
+			break
+		}
+		h[i], h[j] = h[j], h[i]
+		i = j
+	}
+}
+
+func minHeapPush(h *[]cand, c cand) {
+	*h = append(*h, c)
+	minHeapUp(*h, len(*h)-1)
+}
+
+func minHeapPop(h *[]cand) cand {
+	n := len(*h) - 1
+	(*h)[0], (*h)[n] = (*h)[n], (*h)[0]
+	minHeapDown(*h, 0, n)
+	x := (*h)[n]
+	*h = (*h)[:n]
 	return x
 }
 
-// maxCandHeap: maior distância no topo (descarta os piores do resultado).
-type maxCandHeap []cand
+// ── maxHeap (resultados) ──────────────────────────────────────────────────────
 
-func (h maxCandHeap) Len() int            { return len(h) }
-func (h maxCandHeap) Less(i, j int) bool { return h[i].d > h[j].d }
-func (h maxCandHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *maxCandHeap) Push(x any)        { *h = append(*h, x.(cand)) }
-func (h *maxCandHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[:n-1]
+func maxHeapUp(h []cand, i int) {
+	for i > 0 {
+		parent := (i - 1) >> 1
+		if h[parent].d >= h[i].d {
+			break
+		}
+		h[parent], h[i] = h[i], h[parent]
+		i = parent
+	}
+}
+
+func maxHeapDown(h []cand, i, n int) {
+	for {
+		left := (i << 1) + 1
+		if left >= n {
+			break
+		}
+		j := left
+		if right := left + 1; right < n && h[right].d > h[left].d {
+			j = right
+		}
+		if h[i].d >= h[j].d {
+			break
+		}
+		h[i], h[j] = h[j], h[i]
+		i = j
+	}
+}
+
+func maxHeapPush(h *[]cand, c cand) {
+	*h = append(*h, c)
+	maxHeapUp(*h, len(*h)-1)
+}
+
+func maxHeapPop(h *[]cand) cand {
+	n := len(*h) - 1
+	(*h)[0], (*h)[n] = (*h)[n], (*h)[0]
+	maxHeapDown(*h, 0, n)
+	x := (*h)[n]
+	*h = (*h)[:n]
 	return x
 }
 
@@ -337,14 +402,9 @@ func (h *maxCandHeap) Pop() any {
 func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int, hb *heapBufs) []cand {
 	epD := distSq(q, idx.vecAt(ep))
 
-	// Reutiliza slices pré-alocados sem novas alocações.
+	// Reutiliza slices pré-alocados; minHeap/maxHeap são inline sem boxing.
 	hb.cands = append(hb.cands[:0], cand{ep, epD})
-	cands := (*minCandHeap)(&hb.cands)
-	heap.Init(cands)
-
 	hb.res = append(hb.res[:0], cand{ep, epD})
-	res := (*maxCandHeap)(&hb.res)
-	heap.Init(res)
 
 	stride := 2 * idx.m
 	stride3 := stride * 3 // stride em bytes (3 bytes por vizinho uint24)
@@ -359,11 +419,11 @@ func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int, hb *heapBufs) []
 	vbs.bits[ep>>6] |= 1 << uint(ep&63)
 	vbs.toReset = append(vbs.toReset, ep)
 
-	for cands.Len() > 0 {
-		c := heap.Pop(cands).(cand)
+	for len(hb.cands) > 0 {
+		c := minHeapPop(&hb.cands)
 
 		// Termina se o melhor candidato restante é pior que o pior resultado
-		if res.Len() >= ef && c.d > (*res)[0].d {
+		if len(hb.res) >= ef && c.d > hb.res[0].d {
 			break
 		}
 
@@ -379,11 +439,11 @@ func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int, hb *heapBufs) []
 			vbs.toReset = append(vbs.toReset, nbr)
 
 			d := distSq(q, idx.vecAt(nbr))
-			if res.Len() < ef || d < (*res)[0].d {
-				heap.Push(cands, cand{nbr, d})
-				heap.Push(res, cand{nbr, d})
-				if res.Len() > ef {
-					heap.Pop(res)
+			if len(hb.res) < ef || d < hb.res[0].d {
+				minHeapPush(&hb.cands, cand{nbr, d})
+				maxHeapPush(&hb.res, cand{nbr, d})
+				if len(hb.res) > ef {
+					maxHeapPop(&hb.res)
 				}
 			}
 		}
@@ -391,14 +451,14 @@ func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int, hb *heapBufs) []
 
 	// Reverte o maxHeap (maior distância no topo → menor na frente) e trunca em k.
 	// Sem alocações: opera diretamente sobre hb.res.
-	slice := []cand(*res)
-	for i, j := 0, len(slice)-1; i < j; i, j = i+1, j-1 {
-		slice[i], slice[j] = slice[j], slice[i]
+	n := len(hb.res)
+	for i, j := 0, n-1; i < j; i, j = i+1, j-1 {
+		hb.res[i], hb.res[j] = hb.res[j], hb.res[i]
 	}
-	if len(slice) > k {
-		slice = slice[:k]
+	if n > k {
+		n = k
 	}
-	return slice
+	return hb.res[:n]
 }
 
 // Search encontra os k vizinhos mais próximos de query e retorna a fração
