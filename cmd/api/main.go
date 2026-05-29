@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -82,6 +83,24 @@ func handleReady(w http.ResponseWriter, r *http.Request) {
 }
 
 var approvedJSON = []byte(`{"approved":true,"fraud_score":0}` + "\n")
+var rejectedJSON = []byte(`{"approved":false,"fraud_score":1}` + "\n")
+
+// writeFraudResponse escreve a resposta JSON sem alocações usando strconv.
+// Formato: {"approved":true|false,"fraud_score":X.XXXXXX}
+func writeFraudResponse(w http.ResponseWriter, approved bool, score float32) {
+	var buf [64]byte
+	b := buf[:0]
+	b = append(b, `{"approved":`...)
+	if approved {
+		b = append(b, "true"...)
+	} else {
+		b = append(b, "false"...)
+	}
+	b = append(b, `,"fraud_score":`...)
+	b = strconv.AppendFloat(b, float64(score), 'f', 6, 32)
+	b = append(b, '}', '\n')
+	w.Write(b) //nolint:errcheck
+}
 
 func handleFraudScore(w http.ResponseWriter, r *http.Request) {
 	defer func() {
@@ -124,14 +143,16 @@ func handleFraudScore(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	// Evita alocação de encoder para respostas comuns
-	if approved && score == 0 {
+	// Fast paths para os casos mais comuns.
+	if score == 0 {
 		w.Write(approvedJSON) //nolint:errcheck
 		return
 	}
+	if score == 1 {
+		w.Write(rejectedJSON) //nolint:errcheck
+		return
+	}
 
-	json.NewEncoder(w).Encode(fraudResponse{ //nolint:errcheck
-		Approved:   approved,
-		FraudScore: score,
-	})
+	// Resposta sem alocações de encoder para scores intermediários.
+	writeFraudResponse(w, approved, score)
 }

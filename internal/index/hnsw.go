@@ -15,8 +15,8 @@ import (
 
 const (
 	dim      = 14
-	efSearch = 120 // candidatos na busca do nível 0
-	efFast   = 30  // busca rápida para casos claros (busca adaptativa em dois estágios)
+	efSearch = 60 // candidatos na busca do nível 0 (stage 2)
+	efFast   = 30 // busca rápida para casos claros (stage 1)
 )
 
 // visitedBitset é um bitset reutilizável para rastrear nós visitados no beam search.
@@ -28,13 +28,23 @@ type visitedBitset struct {
 	toReset []int
 }
 
+// heapBufs mantém os slices dos dois heaps de beam search pré-alocados.
+// Reutilizar esses slices entre requisições elimina alocações no hot path e
+// reduz pressão de GC — crítico com GOMAXPROCS=1.
+// cands: candidatos a explorar (minHeap, cresce até ~stride*efSearch elementos).
+// res:   melhores resultados encontrados (maxHeap, cresce até efSearch elementos).
+type heapBufs struct {
+	cands []cand
+	res   []cand
+}
+
 // Index é o índice HNSW carregado em memória.
 type Index struct {
 	n, m, nLayers, entry int
 
 	vectors []int8       // flat, stride dim: nó i → vectors[i*dim:(i+1)*dim]
 	labels  []uint8      // labels[i] = 0 (legit) ou 1 (fraud)
-	adj0    []uint32     // flat, stride 2*M: adj0[i*stride:i*stride+adj0Cnt[i]]
+	adj0    []byte       // flat, 3 bytes/vizinho (uint24 LE): nó i → adj0[i*stride*3:(i*stride+adj0Cnt[i])*3]
 	adj0Cnt []uint8      // adj0Cnt[i] = vizinhos válidos do nó i na camada 0
 	upper   []upperLayer // upper[l] = camada l+1 do grafo HNSW
 
@@ -44,6 +54,10 @@ type Index struct {
 	// Com GOMAXPROCS=1, ao mais poucos goroutines seguram um bitset simultaneamente;
 	// o canal bloqueia se todos estiverem em uso (backpressure sem deadlock).
 	visited chan *visitedBitset
+
+	// heaps é um canal de heapBufs pré-alocados, mesmo padrão que visited.
+	// Elimina alocações de minCandHeap e maxCandHeap a cada requisição.
+	heaps chan *heapBufs
 }
 
 // upperLayer armazena a adjacência de uma camada superior (l >= 1) em CSR.
@@ -89,9 +103,9 @@ func Load(path string) (*Index, error) {
 	labels := make([]uint8, N)
 	io.ReadFull(br, labels) //nolint:errcheck
 
-	// Camada 0: stride fixo — leitura em bloco com binary.Read
-	adj0 := make([]uint32, N*stride)
-	if err := binary.Read(br, binary.LittleEndian, adj0); err != nil {
+	// Camada 0: stride fixo — 3 bytes por vizinho (uint24 LE), N < 2^24
+	adj0 := make([]byte, N*stride*3)
+	if _, err := io.ReadFull(br, adj0); err != nil {
 		return nil, err
 	}
 	adj0Cnt := make([]uint8, N)
@@ -120,8 +134,8 @@ func Load(path string) (*Index, error) {
 		N, M, nLayers, time.Since(start))
 
 	// Pré-aloca 32 bitsets no canal. Cada bitset ocupa (N+63)/64*8 ≈ 375 KB
-	// para N=3M. Total: 32×375KB ≈ 11,7 MB — cabe facilmente no orçamento de 220 MB.
-	// 32 é conservador: na prática ≤2 bitsets são usados simultaneamente com GOMAXPROCS=1.
+	// para N=3M. Total: 32×375KB ≈ 11.7 MB.
+	// Com GOMAXPROCS=1, apenas 1 bitset é usado simultaneamente; 32 é margem ampla.
 	bitWords := (N + 63) / 64
 	const poolSize = 32
 	visitedCh := make(chan *visitedBitset, poolSize)
@@ -132,12 +146,27 @@ func Load(path string) (*Index, error) {
 		}
 	}
 
+	// Pré-aloca heapBufs para eliminar alocações no hot path.
+	// cands pode crescer até stride*efSearch = 6*60 = 360 elementos (pior caso M=3).
+	// res é limitado a efSearch = 60 elementos.
+	// Com GOMAXPROCS=1, apenas 1 heapBufs é usado simultaneamente; pool=32 é seguro.
+	candsCap := stride*efSearch + 16
+	const heapPoolSize = 32
+	heapsCh := make(chan *heapBufs, heapPoolSize)
+	for i := 0; i < heapPoolSize; i++ {
+		heapsCh <- &heapBufs{
+			cands: make([]cand, 0, candsCap),
+			res:   make([]cand, 0, efSearch+1),
+		}
+	}
+
 	return &Index{
 		n: N, m: M, nLayers: nLayers, entry: entry,
 		vectors: vectors, labels: labels,
 		adj0: adj0, adj0Cnt: adj0Cnt,
 		upper:   upper,
 		visited: visitedCh,
+		heaps:   heapsCh,
 	}, nil
 }
 
@@ -266,18 +295,24 @@ func (h *maxCandHeap) Pop() any {
 	return x
 }
 
-// beamSearchL0 realiza a busca na camada 0 com beam width ef,
-// partindo de ep. Retorna até k melhores candidatos ordenados por distância.
-func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int) []cand {
+// beamSearchL0 realiza a busca na camada 0 com beam width ef, partindo de ep.
+// Recebe hb com slices pré-alocados para evitar alocações no hot path.
+// Retorna até k melhores candidatos em hb.res (ordenados por distância crescente).
+// ATENÇÃO: o slice retornado aponta para hb.res — inválido após a próxima chamada com o mesmo hb.
+func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int, hb *heapBufs) []cand {
 	epD := distSq(q, idx.vecAt(ep))
 
-	cands := &minCandHeap{cand{ep, epD}}
+	// Reutiliza slices pré-alocados sem novas alocações.
+	hb.cands = append(hb.cands[:0], cand{ep, epD})
+	cands := (*minCandHeap)(&hb.cands)
 	heap.Init(cands)
 
-	res := &maxCandHeap{cand{ep, epD}}
+	hb.res = append(hb.res[:0], cand{ep, epD})
+	res := (*maxCandHeap)(&hb.res)
 	heap.Init(res)
 
 	stride := 2 * idx.m
+	stride3 := stride * 3 // stride em bytes (3 bytes por vizinho uint24)
 	vbs := <-idx.visited
 	defer func() {
 		for _, n := range vbs.toReset {
@@ -298,9 +333,10 @@ func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int) []cand {
 		}
 
 		cnt := int(idx.adj0Cnt[c.idx])
-		base := c.idx * stride
+		base := c.idx * stride3
 		for j := 0; j < cnt; j++ {
-			nbr := int(idx.adj0[base+j])
+			p := base + j*3
+			nbr := int(idx.adj0[p]) | int(idx.adj0[p+1])<<8 | int(idx.adj0[p+2])<<16
 			if vbs.bits[nbr>>6]>>uint(nbr&63)&1 != 0 {
 				continue
 			}
@@ -318,8 +354,8 @@ func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int) []cand {
 		}
 	}
 
-	// Extrai os k melhores: reverte o heap (máximo no topo → mínimo na frente)
-	// e trunca em k. O(ef) sem alocações extras.
+	// Reverte o maxHeap (maior distância no topo → menor na frente) e trunca em k.
+	// Sem alocações: opera diretamente sobre hb.res.
 	slice := []cand(*res)
 	for i, j := 0, len(slice)-1; i < j; i, j = i+1, j-1 {
 		slice[i], slice[j] = slice[j], slice[i]
@@ -334,11 +370,9 @@ func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int) []cand {
 // de vizinhos fraudulentos (fraud score em [0.0, 1.0]).
 //
 // Usa busca adaptativa em dois estágios com k=5 e threshold=0.6:
-// - Estágio 1 (ef=efFast): rápido para casos claros (score ∈ {0.0, 0.8, 1.0})
-// - Estágio 2 (ef=efSearch): refino para casos limítrofes ou potenciais FN
-//   (score ∈ {0.2, 0.4, 0.6}): inclui fraudCount=1 pois efFast pode perder
-//   vizinhos fraud reais, convertendo um true score de 3/5 em 1/5.
-// Os valores abaixo são específicos para k=5; ajustar se k mudar.
+// - Estágio 1 (ef=efFast): rápido para casos claros (score ∈ {0.0, 0.2, 0.8, 1.0})
+// - Estágio 2 (ef=efSearch): refino apenas para casos limítrofes (score ∈ {0.4, 0.6})
+// Os valores 2 e 3 abaixo são específicos para k=5; ajustar se k mudar.
 func (idx *Index) Search(query []float32, k int) float32 {
 	q := quantizeQuery(query)
 	ep := idx.entry
@@ -348,8 +382,13 @@ func (idx *Index) Search(query []float32, k int) float32 {
 		ep = idx.greedyDescend(&idx.upper[l], ep, &q)
 	}
 
+	// Adquire heapBufs pré-alocado; os slices internos são reutilizados
+	// pelas duas chamadas a beamSearchL0 sem novas alocações de heap.
+	hb := <-idx.heaps
+	defer func() { idx.heaps <- hb }()
+
 	// Estágio 1: busca rápida com efFast
-	results := idx.beamSearchL0(ep, &q, efFast, k)
+	results := idx.beamSearchL0(ep, &q, efFast, k, hb)
 	var fraudCount int
 	for _, r := range results {
 		if idx.labels[r.idx] == 1 {
@@ -357,17 +396,16 @@ func (idx *Index) Search(query []float32, k int) float32 {
 		}
 	}
 
-	// Retorno antecipado apenas para casos inequívocos:
-	// - 0/5 fraud → claramente legítimo
-	// - 4/5 ou 5/5 fraud → claramente fraude
-	// Refina 1/5, 2/5 e 3/5: efFast pode perder vizinhos fraud reais,
-	// transformando um true score de 3/5 em 1/5 e gerando falso negativo.
-	if fraudCount == 0 || fraudCount >= 4 {
+	// Retorno antecipado para casos claramente aprovados ou rejeitados.
+	// Com k=5 e threshold=0.6: limítrofes são 2/5 (0.4) e 3/5 (0.6).
+	// Refinar apenas esses dois casos minimiza o custo do stage 2.
+	if fraudCount != 2 && fraudCount != 3 {
 		return float32(fraudCount) / float32(k)
 	}
 
-	// Estágio 2: refina com ef maior para todos os casos ambíguos
-	results = idx.beamSearchL0(ep, &q, efSearch, k)
+	// Estágio 2: refina resultado limítrofe com ef maior.
+	// hb.cands e hb.res são resetados no início da chamada — sem alocações.
+	results = idx.beamSearchL0(ep, &q, efSearch, k, hb)
 	fraudCount = 0
 	for _, r := range results {
 		if idx.labels[r.idx] == 1 {

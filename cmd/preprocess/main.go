@@ -9,7 +9,7 @@
 //	[N*14] int8           — vetores quantizados (flat, stride=14)
 //	[N] uint8             — labels (0=legit, 1=fraud)
 //	--- Camada 0 (todos os N nós, stride fixo) ---
-//	[N * stride] uint32   — adj0: vizinhos (stride slots por nó, 0-padded)
+//	[N * stride * 3] byte — adj0: vizinhos em uint24 LE (stride slots por nó, 0-padded)
 //	[N] uint8             — adj0Counts: vizinhos válidos por nó
 //	--- Camadas 1..nLayers-1 (CSR por camada) ---
 //	  [4] uint32 Nl          — nós nessa camada
@@ -91,7 +91,7 @@ func main() {
 	}
 
 	graph := hnsw.NewGraph[int]()
-	graph.M = 4         // melhor recall; index.bin ~149 MB, runtime ~189 MB (limite 220 MB)
+	graph.M = 3         // adj0 uint24: 54 MB (vs 72 MB uint32), mais headroom para GC em 220 MB
 	graph.EfSearch = 200 // alta qualidade na construção
 	graph.Distance = hnsw.EuclideanDistance
 
@@ -262,6 +262,13 @@ func main() {
 		bw.Write(buf[:])
 	}
 
+	// write24 escreve um uint32 em 3 bytes LE (uint24). N < 2^24 garante que não há overflow.
+	write24 := func(v uint32) {
+		bw.WriteByte(byte(v))
+		bw.WriteByte(byte(v >> 8))
+		bw.WriteByte(byte(v >> 16))
+	}
+
 	// Cabeçalho
 	write32(uint32(N))
 	write32(uint32(M))
@@ -301,13 +308,15 @@ func main() {
 		}
 	}
 
+	// Escreve adj0 em formato uint24 LE (3 bytes por vizinho)
+	// para economizar 24 MB vs uint32 com M=4, mantendo adj0 em ~72 MB.
 	for _, v := range adj0 {
-		write32(v)
+		write24(v)
 	}
 	adj0 = nil
 	bw.Write(adj0Counts)
 	adj0Counts = nil
-	log.Printf("  camada 0 escrita (%d nós, stride=%d)", N, stride)
+	log.Printf("  camada 0 escrita (%d nós, stride=%d, uint24)", N, stride)
 
 	// ── Camadas superiores (l=1..nLayers-1): CSR ──────────────────────────
 	for l := 1; l < nLayers; l++ {
