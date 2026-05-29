@@ -20,6 +20,8 @@ services:
     build: .
     environment:
       - GOMAXPROCS=1
+      - GOMEMLIMIT=145MiB
+      - GOGC=100
     healthcheck:
       test: [ "CMD", "wget", "-qO-", "http://localhost:8080/ready" ]
       interval: 5s
@@ -30,12 +32,14 @@ services:
       resources:
         limits:
           cpus: "0.45"
-          memory: "220MB"
+          memory: "170MB"
 
   api_2:
     build: .
     environment:
       - GOMAXPROCS=1
+      - GOMEMLIMIT=145MiB
+      - GOGC=100
     healthcheck:
       test: [ "CMD", "wget", "-qO-", "http://localhost:8080/ready" ]
       interval: 5s
@@ -46,7 +50,7 @@ services:
       resources:
         limits:
           cpus: "0.45"
-          memory: "220MB"
+          memory: "170MB"
 
 networks:
   default:

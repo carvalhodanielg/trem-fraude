@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -71,6 +73,13 @@ func startup() {
 
 	// idx é o último a ser armazenado — é ele que sinaliza que está pronto
 	idxPtr.Store(idx)
+
+	// Devolve ao OS qualquer heap Go liberado durante o loading.
+	// Com mmap, o heap permanente é apenas pools + runtime (~5-15 MB);
+	// isso reduz RSS imediatamente, garantindo espaço para allocações do HTTP.
+	runtime.GC()
+	debug.FreeOSMemory()
+
 	log.Println("pronto para receber requisições")
 }
 

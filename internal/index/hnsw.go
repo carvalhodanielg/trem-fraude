@@ -1,16 +1,17 @@
 // Package index implementa busca HNSW sobre o índice compacto gerado
 // pelo cmd/preprocess. O índice usa vetores quantizados em int8 e
-// adjacência em arrays flat (sem maps), cabendo em ~138 MB para 3M nós.
+// adjacência em arrays flat (sem maps).
+// O Load usa mmap(2) para mapear o arquivo diretamente — zero cópia,
+// sem pressão no heap Go nem no GC. Dois containers da mesma imagem Docker
+// (overlayfs) compartilham as mesmas physical pages do page cache.
 package index
 
 import (
-	"bufio"
 	"container/heap"
 	"encoding/binary"
-	"io"
 	"log"
-	"os"
 	"time"
+	"unsafe"
 )
 
 const (
@@ -42,6 +43,8 @@ type heapBufs struct {
 type Index struct {
 	n, m, nLayers, entry int
 
+	// Dados do índice: views zero-cópia sobre o arquivo mmap'd (mmapData).
+	// O GC Go não gerencia nem escaneia o backing array desses slices.
 	vectors []int8       // flat, stride dim: nó i → vectors[i*dim:(i+1)*dim]
 	labels  []uint8      // labels[i] = 0 (legit) ou 1 (fraud)
 	adj0    []byte       // flat, 3 bytes/vizinho (uint24 LE): nó i → adj0[i*stride*3:(i*stride+adj0Cnt[i])*3]
@@ -49,15 +52,18 @@ type Index struct {
 	upper   []upperLayer // upper[l] = camada l+1 do grafo HNSW
 
 	// visited é um canal de bitsets pré-alocados usados no beam search.
-	// Canal em vez de sync.Pool: o canal mantém referências vivas aos bitsets,
-	// evitando que o GC os evicte e force realocações de 375 KB por requisição.
-	// Com GOMAXPROCS=1, ao mais poucos goroutines seguram um bitset simultaneamente;
-	// o canal bloqueia se todos estiverem em uso (backpressure sem deadlock).
+	// Com GOMAXPROCS=1, tamanho 2 é suficiente: 1 em uso + 1 de folga para
+	// preempção assíncrona do scheduler. O canal mantém os bitsets vivos
+	// (evita GC) e fornece backpressure sem deadlock.
 	visited chan *visitedBitset
 
 	// heaps é um canal de heapBufs pré-alocados, mesmo padrão que visited.
 	// Elimina alocações de minCandHeap e maxCandHeap a cada requisição.
 	heaps chan *heapBufs
+
+	// mmapData mantém o slice mmap'd vivo enquanto o Index existir.
+	// Todos os slices de dados acima são views deste slice.
+	mmapData []byte
 }
 
 // upperLayer armazena a adjacência de uma camada superior (l >= 1) em CSR.
@@ -67,77 +73,82 @@ type upperLayer struct {
 	nbr   []uint32 // vizinhos (off[Nl] entradas)
 }
 
-// Load lê o binário compacto gerado pelo cmd/preprocess.
+// Load lê o binário compacto gerado pelo cmd/preprocess via mmap(2).
+//
+// Todos os arrays de dados (vectors, labels, adj0, adj0Cnt, upper CSR) são views
+// zero-cópia do arquivo mapeado — não pressionam o heap Go nem o GC.
+// Dois containers da mesma imagem Docker (overlayfs read-only layer) compartilham
+// as mesmas physical pages do page cache do kernel: ~122 MB pagos uma vez no total.
+//
+// Alinhamento dos uint32/int32 nas camadas superiores garantido porque:
+//   header(16) + vectors(N×14) + labels(N) + adj0(N×stride×3) + adj0Cnt(N)
+//   = 16 + N×(14+1+18+1) = 16 + N×34
+// Para N=3.000.000: 16 + 102.000.000 = 102.000.016 ≡ 0 (mod 4). ✓
 func Load(path string) (*Index, error) {
 	start := time.Now()
-	log.Println("carregando índice HNSW...")
+	log.Println("carregando índice HNSW via mmap...")
 
-	f, err := os.Open(path)
+	data, err := mmapReadOnly(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 
-	// Buffer menor: 512KB economiza ~7.5 MB vs 8 MB durante o loading.
-	br := bufio.NewReaderSize(f, 512<<10)
-
-	r32 := func() uint32 {
-		var buf [4]byte
-		io.ReadFull(br, buf[:]) //nolint:errcheck
-		return binary.LittleEndian.Uint32(buf[:])
+	cur := 0
+	readU32 := func() uint32 {
+		v := binary.LittleEndian.Uint32(data[cur:])
+		cur += 4
+		return v
 	}
 
-	N := int(r32())
-	M := int(r32())
-	nLayers := int(r32())
-	entry := int(r32())
+	N := int(readU32())
+	M := int(readU32())
+	nLayers := int(readU32())
+	entry := int(readU32())
 	stride := 2 * M
 
-	// Vetores quantizados — binary.Read lê int8 byte-a-byte sem alocações extras.
-	vectors := make([]int8, N*dim)
-	if err := binary.Read(br, binary.LittleEndian, vectors); err != nil {
-		return nil, err
-	}
+	// Vetores int8 — view direta (alinhamento 1: sempre OK).
+	vectors := unsafe.Slice((*int8)(unsafe.Pointer(&data[cur])), N*dim)
+	cur += N * dim
 
-	// Labels
-	labels := make([]uint8, N)
-	io.ReadFull(br, labels) //nolint:errcheck
+	// Labels uint8 = byte — slice direto.
+	labels := data[cur : cur+N]
+	cur += N
 
-	// Camada 0: stride fixo — 3 bytes por vizinho (uint24 LE), N < 2^24
-	adj0 := make([]byte, N*stride*3)
-	if _, err := io.ReadFull(br, adj0); err != nil {
-		return nil, err
-	}
-	adj0Cnt := make([]uint8, N)
-	io.ReadFull(br, adj0Cnt) //nolint:errcheck
+	// Camada 0: adj0 uint24 — slice direto como []byte.
+	adj0Size := N * stride * 3
+	adj0 := data[cur : cur+adj0Size]
+	cur += adj0Size
 
-	// Camadas superiores (l=1..nLayers-1): CSR
+	// adj0Cnt uint8 — slice direto.
+	adj0Cnt := data[cur : cur+N]
+	cur += N
+
+	// Camadas superiores (l=1..nLayers-1): CSR com views uint32/int32.
+	// Alinhamento 4 verificado no comentário do Load acima.
 	upper := make([]upperLayer, 0, nLayers-1)
 	for l := 1; l < nLayers; l++ {
-		Nl := int(r32())
-		nodes := make([]int32, Nl)
-		if err := binary.Read(br, binary.LittleEndian, nodes); err != nil {
-			return nil, err
-		}
-		off := make([]uint32, Nl+1)
-		if err := binary.Read(br, binary.LittleEndian, off); err != nil {
-			return nil, err
-		}
-		nbr := make([]uint32, off[Nl])
-		if err := binary.Read(br, binary.LittleEndian, nbr); err != nil {
-			return nil, err
-		}
+		Nl := int(readU32())
+
+		nodes := unsafe.Slice((*int32)(unsafe.Pointer(&data[cur])), Nl)
+		cur += Nl * 4
+
+		off := unsafe.Slice((*uint32)(unsafe.Pointer(&data[cur])), Nl+1)
+		cur += (Nl + 1) * 4
+
+		nbrCount := int(off[Nl])
+		nbr := unsafe.Slice((*uint32)(unsafe.Pointer(&data[cur])), nbrCount)
+		cur += nbrCount * 4
+
 		upper = append(upper, upperLayer{nodes: nodes, off: off, nbr: nbr})
 	}
 
 	log.Printf("índice HNSW carregado: %d nós, M=%d, %d camadas em %s",
 		N, M, nLayers, time.Since(start))
 
-	// Pré-aloca 32 bitsets no canal. Cada bitset ocupa (N+63)/64*8 ≈ 375 KB
-	// para N=3M. Total: 32×375KB ≈ 11.7 MB.
-	// Com GOMAXPROCS=1, apenas 1 bitset é usado simultaneamente; 32 é margem ampla.
+	// Pool tamanho 2: com GOMAXPROCS=1, 1 bitset em uso + 1 folga para
+	// preempção assíncrona do scheduler. Memória: 2×375KB ≈ 750 KB (vs 32×375KB≈12MB antes).
 	bitWords := (N + 63) / 64
-	const poolSize = 32
+	const poolSize = 2
 	visitedCh := make(chan *visitedBitset, poolSize)
 	for i := 0; i < poolSize; i++ {
 		visitedCh <- &visitedBitset{
@@ -146,12 +157,10 @@ func Load(path string) (*Index, error) {
 		}
 	}
 
-	// Pré-aloca heapBufs para eliminar alocações no hot path.
-	// cands pode crescer até stride*efSearch = 6*60 = 360 elementos (pior caso M=3).
-	// res é limitado a efSearch = 60 elementos.
-	// Com GOMAXPROCS=1, apenas 1 heapBufs é usado simultaneamente; pool=32 é seguro.
+	// Pool de heapBufs tamanho 2 pelo mesmo motivo.
+	// cands pode crescer até stride*efSearch = 6*60 = 360 elementos; res até efSearch=60.
 	candsCap := stride*efSearch + 16
-	const heapPoolSize = 32
+	const heapPoolSize = 2
 	heapsCh := make(chan *heapBufs, heapPoolSize)
 	for i := 0; i < heapPoolSize; i++ {
 		heapsCh <- &heapBufs{
@@ -162,11 +171,14 @@ func Load(path string) (*Index, error) {
 
 	return &Index{
 		n: N, m: M, nLayers: nLayers, entry: entry,
-		vectors: vectors, labels: labels,
-		adj0: adj0, adj0Cnt: adj0Cnt,
-		upper:   upper,
-		visited: visitedCh,
-		heaps:   heapsCh,
+		vectors:  vectors,
+		labels:   labels,
+		adj0:     adj0,
+		adj0Cnt:  adj0Cnt,
+		upper:    upper,
+		visited:  visitedCh,
+		heaps:    heapsCh,
+		mmapData: data,
 	}, nil
 }
 
