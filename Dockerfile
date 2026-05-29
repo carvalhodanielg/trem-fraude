@@ -3,7 +3,9 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN go build -ldflags="-s -w" -o api ./cmd/api
+# -pgo=auto usa cmd/api/default.pgo para Profile-Guided Optimization (Go 1.21+).
+# O profile foi coletado sob carga real (374k req/30s); ganho típico: 5-15% no p99.
+RUN go build -pgo=auto -ldflags="-s -w" -o api ./cmd/api
 RUN go build -ldflags="-s -w" -o preprocess ./cmd/preprocess
 # Constrói o índice HNSW a partir de references.json.gz (~3-4 min, ~900 MB RAM)
 RUN ./preprocess

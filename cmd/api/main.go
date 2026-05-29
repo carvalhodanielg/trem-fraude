@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"log"
 	"net/http"
+	_ "net/http/pprof" // registra /debug/pprof/* para coleta de CPU profile (PGO)
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -47,6 +48,17 @@ func main() {
 	mux.HandleFunc("POST /fraud-score", handleFraudScore)
 
 	go startup()
+
+	// Servidor de pprof no :6060 (isolado do path de produção).
+	// Usado para coleta de CPU profile para PGO:
+	//   curl -o cmd/api/default.pgo "http://localhost:6060/debug/pprof/profile?seconds=30"
+	// O import de _ "net/http/pprof" registra os handlers no DefaultServeMux.
+	go func() {
+		log.Println("pprof listening on :6060")
+		if err := http.ListenAndServe(":6060", nil); err != nil {
+			log.Printf("pprof server error: %v", err)
+		}
+	}()
 
 	srv := &http.Server{
 		Addr:         ":8080",

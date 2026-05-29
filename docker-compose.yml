@@ -21,7 +21,7 @@ services:
     environment:
       - GOMAXPROCS=1
       - GOMEMLIMIT=145MiB
-      - GOGC=100
+      - GOGC=200
     healthcheck:
       test: [ "CMD", "wget", "-qO-", "http://localhost:8080/ready" ]
       interval: 5s
@@ -39,7 +39,7 @@ services:
     environment:
       - GOMAXPROCS=1
       - GOMEMLIMIT=145MiB
-      - GOGC=100
+      - GOGC=200
     healthcheck:
       test: [ "CMD", "wget", "-qO-", "http://localhost:8080/ready" ]
       interval: 5s
