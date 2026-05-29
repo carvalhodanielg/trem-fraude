@@ -91,7 +91,7 @@ func main() {
 	}
 
 	graph := hnsw.NewGraph[int]()
-	graph.M = 3         // adj0 uint24: 54 MB (vs 72 MB uint32), mais headroom para GC em 220 MB
+	graph.M = 4         // adj0 uint24: 72 MB — mais conectividade, menos mínimos locais; file-backed mmap não conta contra limite do container
 	graph.EfSearch = 200 // alta qualidade na construção
 	graph.Distance = hnsw.EuclideanDistance
 

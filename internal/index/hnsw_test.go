@@ -81,8 +81,8 @@ func TestSearchLatency(t *testing.T) {
 	}
 }
 
-// BenchmarkSearchClear mede o hot path de casos claramente aprovados/rejeitados
-// (fraudCount ∉ {2,3}), onde apenas o estágio 1 é executado.
+// BenchmarkSearchClear mede o hot path de casos absolutamente claros
+// (fraudCount = 0 ou k=5), onde apenas o estágio 1 é executado.
 func BenchmarkSearchClear(b *testing.B) {
 	idx := openIndex(b)
 	// Transação claramente fraudulenta (fraudCount=5, apenas stage-1)
@@ -98,9 +98,9 @@ func BenchmarkSearchClear(b *testing.B) {
 	}
 }
 
-// BenchmarkSearchAmbiguous mede casos limítrofes que ativam o estágio 2.
-// Usa vetores na "fronteira" entre legítimo e fraude para forçar fraudCount ∈ {2,3}.
-// O modo expand (stage-2 continua stage-1) é o que esta task otimiza.
+// BenchmarkSearchAmbiguous mede casos que ativam o estágio 2.
+// Stage-2 agora é acionado para fraudCount ∈ {1,2,3,4} — qualquer resultado
+// não-extremo. O modo expand (stage-2 continua stage-1) garante zero trabalho duplicado.
 func BenchmarkSearchAmbiguous(b *testing.B) {
 	idx := openIndex(b)
 	// Vetor intermediário: mistura características legítimas e fraudulentas
@@ -117,10 +117,15 @@ func BenchmarkSearchAmbiguous(b *testing.B) {
 	}
 }
 
-// BenchmarkCountFraudTopK mede o custo do helper de contagem não-destrutiva.
-func BenchmarkCountFraudTopK(b *testing.B) {
+// BenchmarkTopKFraudCountFloat32 mede o custo da seleção float32 de todos os candidatos.
+func BenchmarkTopKFraudCountFloat32(b *testing.B) {
 	idx := openIndex(b)
-	// Constrói um heap simulado com efFast=30 candidatos arbitrários.
+	// Query aleatória realista.
+	query := make([]float32, 14)
+	for i := range query {
+		query[i] = float32(i) / 14.0
+	}
+	// Constrói um pool simulado com efFast=30 candidatos arbitrários.
 	h := make([]cand, 30)
 	for i := range h {
 		h[i] = cand{idx: i * 100, d: int32(i * 50)}
@@ -128,6 +133,6 @@ func BenchmarkCountFraudTopK(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_ = idx.countFraudTopK(h, 5)
+		_ = idx.topKFraudCountFloat32(query, h, 5)
 	}
 }
