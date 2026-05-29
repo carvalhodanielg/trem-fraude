@@ -395,34 +395,30 @@ func maxHeapPop(h *[]cand) cand {
 	return x
 }
 
-// beamSearchL0 realiza a busca na camada 0 com beam width ef, partindo de ep.
-// Recebe hb com slices pré-alocados para evitar alocações no hot path.
-// Retorna até k melhores candidatos em hb.res (ordenados por distância crescente).
-// ATENÇÃO: o slice retornado aponta para hb.res — inválido após a próxima chamada com o mesmo hb.
-func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int, hb *heapBufs) []cand {
-	epD := distSq(q, idx.vecAt(ep))
+// beamSearchLoop executa o loop de beam search na camada 0.
+//
+// Se ep >= 0: inicializa hb.cands/hb.res a partir de ep e marca ep em vbs.
+// Se ep < 0:  continua de onde parou (modo expand — stage-2 continuando stage-1),
+//             reaproveitando hb.cands (fronteira não-explorada) e hb.res (maxHeap atual).
+//
+// Ao retornar, hb.res é um maxHeap válido com até ef melhores candidatos.
+// A finalização (reversão + truncagem) é responsabilidade do chamador.
+func (idx *Index) beamSearchLoop(ep int, q *[dim]int8, ef int, hb *heapBufs, vbs *visitedBitset) {
+	if ep >= 0 {
+		epD := distSq(q, idx.vecAt(ep))
+		hb.cands = append(hb.cands[:0], cand{ep, epD})
+		hb.res = append(hb.res[:0], cand{ep, epD})
+		vbs.bits[ep>>6] |= 1 << uint(ep&63)
+		vbs.toReset = append(vbs.toReset, ep)
+	}
+	// modo expand: hb.cands e hb.res já têm estado do stage anterior.
 
-	// Reutiliza slices pré-alocados; minHeap/maxHeap são inline sem boxing.
-	hb.cands = append(hb.cands[:0], cand{ep, epD})
-	hb.res = append(hb.res[:0], cand{ep, epD})
-
-	stride := 2 * idx.m
-	stride3 := stride * 3 // stride em bytes (3 bytes por vizinho uint24)
-	vbs := <-idx.visited
-	defer func() {
-		for _, n := range vbs.toReset {
-			vbs.bits[n>>6] &^= 1 << uint(n&63)
-		}
-		vbs.toReset = vbs.toReset[:0]
-		idx.visited <- vbs
-	}()
-	vbs.bits[ep>>6] |= 1 << uint(ep&63)
-	vbs.toReset = append(vbs.toReset, ep)
+	stride3 := 2 * idx.m * 3 // bytes por linha do adj0
 
 	for len(hb.cands) > 0 {
 		c := minHeapPop(&hb.cands)
 
-		// Termina se o melhor candidato restante é pior que o pior resultado
+		// Termina se o melhor candidato restante é pior que o pior resultado.
 		if len(hb.res) >= ef && c.d > hb.res[0].d {
 			break
 		}
@@ -448,17 +444,95 @@ func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int, hb *heapBufs) []
 			}
 		}
 	}
+}
 
-	// Reverte o maxHeap (maior distância no topo → menor na frente) e trunca em k.
-	// Sem alocações: opera diretamente sobre hb.res.
-	n := len(hb.res)
-	for i, j := 0, n-1; i < j; i, j = i+1, j-1 {
-		hb.res[i], hb.res[j] = hb.res[j], hb.res[i]
+// beamSearchL0 executa beam search na camada 0, gerenciando o reset do vbs.
+//
+// ep >= 0: busca normal — reseta vbs e inicializa a partir do entry point ep.
+// ep < 0:  modo expand — continua de onde stage-1 parou, reutilizando
+//          hb.cands (fronteira não-explorada), hb.res (maxHeap atual) e vbs
+//          intactos. Evita reprocessar nós já visitados.
+//
+// Ao retornar, hb.res é um maxHeap com até ef melhores candidatos.
+// O chamador deve chamar trimAndReturn para obter os k melhores.
+func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef int, hb *heapBufs, vbs *visitedBitset) {
+	if ep >= 0 {
+		// Modo normal: limpa bits marcados na busca anterior (O(nós visitados)).
+		for _, n := range vbs.toReset {
+			vbs.bits[n>>6] &^= 1 << uint(n&63)
+		}
+		vbs.toReset = vbs.toReset[:0]
 	}
-	if n > k {
-		n = k
+	// ep < 0: modo expand — vbs, hb.cands e hb.res já têm estado de stage-1.
+	idx.beamSearchLoop(ep, q, ef, hb, vbs)
+}
+
+// countFraudTopK conta quantos dos k vizinhos mais próximos em h (maxHeap) são fraude.
+// Não modifica h — leitura pura, preserva estado do heap para o estágio 2.
+// Usa seleção parcial O(n·k) onde n≤efFast=30, k=5 → O(150), negligível.
+func (idx *Index) countFraudTopK(h []cand, k int) int {
+	n := len(h)
+	if n == 0 {
+		return 0
 	}
-	return hb.res[:n]
+	if n <= k {
+		// Todos os n candidatos estão no top-k.
+		count := 0
+		for _, c := range h {
+			if idx.labels[c.idx] == 1 {
+				count++
+			}
+		}
+		return count
+	}
+
+	// Seleção parcial: mantém os k menores em top[0..k-1] sem alocar.
+	// Array fixo na stack (k ≤ 5).
+	var top [5]cand
+	worstD := int32(-1)
+	worstI := 0
+	filled := 0
+
+	for _, c := range h {
+		if filled < k {
+			top[filled] = c
+			filled++
+			if filled == k {
+				// Inicializa rastreamento do pior no top.
+				worstD, worstI = top[0].d, 0
+				for j := 1; j < k; j++ {
+					if top[j].d > worstD {
+						worstD, worstI = top[j].d, j
+					}
+				}
+			}
+		} else if c.d < worstD {
+			top[worstI] = c
+			worstD, worstI = top[0].d, 0
+			for j := 1; j < k; j++ {
+				if top[j].d > worstD {
+					worstD, worstI = top[j].d, j
+				}
+			}
+		}
+	}
+
+	count := 0
+	for i := 0; i < filled; i++ {
+		if idx.labels[top[i].idx] == 1 {
+			count++
+		}
+	}
+	return count
+}
+
+// trimAndReturn trimma h (maxHeap) para os k menores elementos e retorna o slice.
+// Operação destrutiva em h — só chamar após o último estágio de busca.
+func trimAndReturn(h *[]cand, k int) []cand {
+	for len(*h) > k {
+		maxHeapPop(h)
+	}
+	return *h
 }
 
 // Search encontra os k vizinhos mais próximos de query e retorna a fração
@@ -467,10 +541,9 @@ func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int, hb *heapBufs) []
 // Pipeline de 3 fases:
 //  1. Estágio 1 (ef=efFast): busca int8 rápida.
 //  2. Estágio 2 (ef=efSearch): apenas se resultado for limítrofe (2 ou 3 de k=5).
+//     Continua do estado de stage-1 (fronteira + visited intactos) — sem trabalho duplicado.
 //  3. Rerank float32: recalcula distâncias dos k candidatos com a query
-//     original (float32), antes da quantização int8. Corrige o erro de
-//     arredondamento da quantização e melhora o recall, especialmente nos
-//     casos em que vizinhos estão a distâncias muito próximas.
+//     original (float32), antes da quantização int8.
 func (idx *Index) Search(query []float32, k int) float32 {
 	q := quantizeQuery(query)
 	ep := idx.entry
@@ -480,33 +553,32 @@ func (idx *Index) Search(query []float32, k int) float32 {
 		ep = idx.greedyDescend(&idx.upper[l], ep, &q)
 	}
 
-	// Adquire heapBufs pré-alocado; os slices internos são reutilizados
-	// pelas duas chamadas a beamSearchL0 sem novas alocações de heap.
+	// Adquire heapBufs e visitedBitset pré-alocados.
+	// Ambos são compartilhados entre stage-1 e stage-2: stage-2 continua
+	// exatamente de onde stage-1 parou (modo expand, ep=-1).
 	hb := <-idx.heaps
 	defer func() { idx.heaps <- hb }()
 
-	// Estágio 1: busca rápida com efFast
-	results := idx.beamSearchL0(ep, &q, efFast, k, hb)
+	vbs := <-idx.visited
+	defer func() { idx.visited <- vbs }()
 
-	// Contagem inicial pós stage-1
-	var fraudCount int
-	for _, r := range results {
-		if idx.labels[r.idx] == 1 {
-			fraudCount++
-		}
-	}
+	// Estágio 1: busca rápida com efFast.
+	idx.beamSearchL0(ep, &q, efFast, hb, vbs)
+
+	// Conta fraudes no top-k sem modificar hb.res.
+	// Preserva hb.res e hb.cands intactos para o estágio 2 (se necessário).
+	fraudCount := idx.countFraudTopK(hb.res, k)
 
 	// Retorno antecipado para casos claramente aprovados ou rejeitados.
 	// Com k=5 e threshold=0.6: limítrofes são 2/5 (0.4) e 3/5 (0.6).
 	if fraudCount != 2 && fraudCount != 3 {
-		// Rerank float32 mesmo em casos claros: reconstrói com precisão
-		// máxima os k vizinhos (custo: k=5 chamadas a distSqFloat — trivial).
-		return idx.rerankFloat(query, results, k)
+		return idx.rerankFloat(query, trimAndReturn(&hb.res, k), k)
 	}
 
-	// Estágio 2: refina resultado limítrofe com ef maior.
-	results = idx.beamSearchL0(ep, &q, efSearch, k, hb)
-	return idx.rerankFloat(query, results, k)
+	// Estágio 2: continua do estado de stage-1 (ep=-1 → modo expand).
+	// Reutiliza hb.cands (fronteira não-explorada), hb.res e vbs — zero trabalho duplicado.
+	idx.beamSearchL0(-1, &q, efSearch, hb, vbs)
+	return idx.rerankFloat(query, trimAndReturn(&hb.res, k), k)
 }
 
 // rerankFloat recalcula as distâncias dos candidatos usando a query float32
