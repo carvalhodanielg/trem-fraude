@@ -10,29 +10,40 @@ import (
 	"io"
 	"log"
 	"os"
-	"sync"
 	"time"
 )
 
 const (
 	dim      = 14
-	efSearch = 100 // candidatos na busca do nível 0
+	efSearch = 120 // candidatos na busca do nível 0
+	efFast   = 30  // busca rápida para casos claros (busca adaptativa em dois estágios)
 )
 
-// visitedPool reutiliza mapas entre requisições para evitar pressão de GC.
-var visitedPool = sync.Pool{
-	New: func() any { return make(map[int]struct{}, 128) },
+// visitedBitset é um bitset reutilizável para rastrear nós visitados no beam search.
+// Usa []uint64 em vez de map para evitar cache misses e pressão de GC.
+// O campo toReset rastreia quais bits foram marcados, permitindo limpeza eficiente
+// (O(nós visitados) em vez de O(N/64) de um memset completo de 375 KB).
+type visitedBitset struct {
+	bits    []uint64
+	toReset []int
 }
 
 // Index é o índice HNSW carregado em memória.
 type Index struct {
 	n, m, nLayers, entry int
 
-	vectors []int8   // flat, stride dim: nó i → vectors[i*dim:(i+1)*dim]
-	labels  []uint8  // labels[i] = 0 (legit) ou 1 (fraud)
-	adj0    []uint32 // flat, stride 2*M: adj0[i*stride:i*stride+adj0Cnt[i]]
-	adj0Cnt []uint8  // adj0Cnt[i] = vizinhos válidos do nó i na camada 0
+	vectors []int8       // flat, stride dim: nó i → vectors[i*dim:(i+1)*dim]
+	labels  []uint8      // labels[i] = 0 (legit) ou 1 (fraud)
+	adj0    []uint32     // flat, stride 2*M: adj0[i*stride:i*stride+adj0Cnt[i]]
+	adj0Cnt []uint8      // adj0Cnt[i] = vizinhos válidos do nó i na camada 0
 	upper   []upperLayer // upper[l] = camada l+1 do grafo HNSW
+
+	// visited é um canal de bitsets pré-alocados usados no beam search.
+	// Canal em vez de sync.Pool: o canal mantém referências vivas aos bitsets,
+	// evitando que o GC os evicte e force realocações de 375 KB por requisição.
+	// Com GOMAXPROCS=1, ao mais poucos goroutines seguram um bitset simultaneamente;
+	// o canal bloqueia se todos estiverem em uso (backpressure sem deadlock).
+	visited chan *visitedBitset
 }
 
 // upperLayer armazena a adjacência de uma camada superior (l >= 1) em CSR.
@@ -108,11 +119,25 @@ func Load(path string) (*Index, error) {
 	log.Printf("índice HNSW carregado: %d nós, M=%d, %d camadas em %s",
 		N, M, nLayers, time.Since(start))
 
+	// Pré-aloca 32 bitsets no canal. Cada bitset ocupa (N+63)/64*8 ≈ 375 KB
+	// para N=3M. Total: 32×375KB ≈ 11,7 MB — cabe facilmente no orçamento de 220 MB.
+	// 32 é conservador: na prática ≤2 bitsets são usados simultaneamente com GOMAXPROCS=1.
+	bitWords := (N + 63) / 64
+	const poolSize = 32
+	visitedCh := make(chan *visitedBitset, poolSize)
+	for i := 0; i < poolSize; i++ {
+		visitedCh <- &visitedBitset{
+			bits:    make([]uint64, bitWords),
+			toReset: make([]int, 0, 512),
+		}
+	}
+
 	return &Index{
 		n: N, m: M, nLayers: nLayers, entry: entry,
 		vectors: vectors, labels: labels,
 		adj0: adj0, adj0Cnt: adj0Cnt,
-		upper: upper,
+		upper:   upper,
+		visited: visitedCh,
 	}, nil
 }
 
@@ -253,12 +278,16 @@ func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int) []cand {
 	heap.Init(res)
 
 	stride := 2 * idx.m
-	visited := visitedPool.Get().(map[int]struct{})
+	vbs := <-idx.visited
 	defer func() {
-		clear(visited)
-		visitedPool.Put(visited)
+		for _, n := range vbs.toReset {
+			vbs.bits[n>>6] &^= 1 << uint(n&63)
+		}
+		vbs.toReset = vbs.toReset[:0]
+		idx.visited <- vbs
 	}()
-	visited[ep] = struct{}{}
+	vbs.bits[ep>>6] |= 1 << uint(ep&63)
+	vbs.toReset = append(vbs.toReset, ep)
 
 	for cands.Len() > 0 {
 		c := heap.Pop(cands).(cand)
@@ -272,10 +301,11 @@ func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int) []cand {
 		base := c.idx * stride
 		for j := 0; j < cnt; j++ {
 			nbr := int(idx.adj0[base+j])
-			if _, seen := visited[nbr]; seen {
+			if vbs.bits[nbr>>6]>>uint(nbr&63)&1 != 0 {
 				continue
 			}
-			visited[nbr] = struct{}{}
+			vbs.bits[nbr>>6] |= 1 << uint(nbr&63)
+			vbs.toReset = append(vbs.toReset, nbr)
 
 			d := distSq(q, idx.vecAt(nbr))
 			if res.Len() < ef || d < (*res)[0].d {
@@ -302,6 +332,13 @@ func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int) []cand {
 
 // Search encontra os k vizinhos mais próximos de query e retorna a fração
 // de vizinhos fraudulentos (fraud score em [0.0, 1.0]).
+//
+// Usa busca adaptativa em dois estágios com k=5 e threshold=0.6:
+// - Estágio 1 (ef=efFast): rápido para casos claros (score ∈ {0.0, 0.8, 1.0})
+// - Estágio 2 (ef=efSearch): refino para casos limítrofes ou potenciais FN
+//   (score ∈ {0.2, 0.4, 0.6}): inclui fraudCount=1 pois efFast pode perder
+//   vizinhos fraud reais, convertendo um true score de 3/5 em 1/5.
+// Os valores abaixo são específicos para k=5; ajustar se k mudar.
 func (idx *Index) Search(query []float32, k int) float32 {
 	q := quantizeQuery(query)
 	ep := idx.entry
@@ -311,14 +348,31 @@ func (idx *Index) Search(query []float32, k int) float32 {
 		ep = idx.greedyDescend(&idx.upper[l], ep, &q)
 	}
 
-	// Beam search na camada 0
-	results := idx.beamSearchL0(ep, &q, efSearch, k)
-
-	var fraudCount float32
+	// Estágio 1: busca rápida com efFast
+	results := idx.beamSearchL0(ep, &q, efFast, k)
+	var fraudCount int
 	for _, r := range results {
 		if idx.labels[r.idx] == 1 {
 			fraudCount++
 		}
 	}
-	return fraudCount / float32(k)
+
+	// Retorno antecipado apenas para casos inequívocos:
+	// - 0/5 fraud → claramente legítimo
+	// - 4/5 ou 5/5 fraud → claramente fraude
+	// Refina 1/5, 2/5 e 3/5: efFast pode perder vizinhos fraud reais,
+	// transformando um true score de 3/5 em 1/5 e gerando falso negativo.
+	if fraudCount == 0 || fraudCount >= 4 {
+		return float32(fraudCount) / float32(k)
+	}
+
+	// Estágio 2: refina com ef maior para todos os casos ambíguos
+	results = idx.beamSearchL0(ep, &q, efSearch, k)
+	fraudCount = 0
+	for _, r := range results {
+		if idx.labels[r.idx] == 1 {
+			fraudCount++
+		}
+	}
+	return float32(fraudCount) / float32(k)
 }

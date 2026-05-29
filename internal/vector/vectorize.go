@@ -88,7 +88,12 @@ func Vectorize(p Payload, norm NormalizationConstants, mccRisk map[string]float3
 
 	v[0] = clamp(p.Transaction.Amount / norm.MaxAmount)
 	v[1] = clamp(p.Transaction.Installments / norm.MaxInstallments)
-	v[2] = clamp((p.Transaction.Amount / p.Customer.AvgAmount) / norm.AmountVsAvgRatio)
+	// Guard contra divisão por zero: AvgAmount==0 geraria NaN que corromperia o vetor.
+	amtRatio := float32(0)
+	if p.Customer.AvgAmount > 0 {
+		amtRatio = (p.Transaction.Amount / p.Customer.AvgAmount) / norm.AmountVsAvgRatio
+	}
+	v[2] = clamp(amtRatio)
 
 	t, _ := time.Parse(time.RFC3339, p.Transaction.RequestedAt)
 	v[3] = float32(t.UTC().Hour()) / 23.0

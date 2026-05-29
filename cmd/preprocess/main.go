@@ -91,7 +91,7 @@ func main() {
 	}
 
 	graph := hnsw.NewGraph[int]()
-	graph.M = 3         // conservador para caber em 165 MB no runtime
+	graph.M = 4         // melhor recall; index.bin ~149 MB, runtime ~189 MB (limite 220 MB)
 	graph.EfSearch = 200 // alta qualidade na construção
 	graph.Distance = hnsw.EuclideanDistance
 

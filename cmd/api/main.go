@@ -118,9 +118,9 @@ func handleFraudScore(w http.ResponseWriter, r *http.Request) {
 	}
 
 	vec := vector.Vectorize(payload, *norm, *risk)
-	score := idx.Search(vec[:], 9)
+	score := idx.Search(vec[:], 5)
 
-	approved := score < 0.4
+	approved := score < 0.6
 
 	w.Header().Set("Content-Type", "application/json")
 
