@@ -15,35 +15,41 @@ type NormalizationConstants struct {
 	MaxMerchantAvgAmount float32 `json:"max_merchant_avg_amount"`
 }
 
+//easyjson:json
 type Transaction struct {
 	Amount       float32 `json:"amount"`
 	Installments float32 `json:"installments"`
 	RequestedAt  string  `json:"requested_at"`
 }
 
+//easyjson:json
 type Customer struct {
 	AvgAmount      float32  `json:"avg_amount"`
 	TxCount24h     float32  `json:"tx_count_24h"`
 	KnownMerchants []string `json:"known_merchants"`
 }
 
+//easyjson:json
 type Merchant struct {
 	ID        string  `json:"id"`
 	MCC       string  `json:"mcc"`
 	AvgAmount float32 `json:"avg_amount"`
 }
 
+//easyjson:json
 type Terminal struct {
 	IsOnline    bool    `json:"is_online"`
 	CardPresent bool    `json:"card_present"`
 	KmFromHome  float32 `json:"km_from_home"`
 }
 
+//easyjson:json
 type LastTransaction struct {
 	Timestamp     string  `json:"timestamp"`
 	KmFromCurrent float32 `json:"km_from_current"`
 }
 
+//easyjson:json
 type Payload struct {
 	Transaction     Transaction      `json:"transaction"`
 	Customer        Customer         `json:"customer"`

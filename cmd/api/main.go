@@ -1,14 +1,17 @@
 package main
 
 import (
-	"encoding/json"
+	"bytes"
 	"log"
 	"net/http"
 	"runtime"
 	"runtime/debug"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	gojson "github.com/goccy/go-json"
 
 	"github.com/carvalhodanielg/trem-de-fraude/internal/index"
 	"github.com/carvalhodanielg/trem-de-fraude/internal/vector"
@@ -19,6 +22,10 @@ var (
 	normPtr atomic.Pointer[vector.NormalizationConstants]
 	riskPtr atomic.Pointer[map[string]float32]
 )
+
+// reqBufPool reutiliza bytes.Buffer entre requisições para evitar alocações
+// de heap no body reading. Payloads do dataset cabem em < 1 KB.
+var reqBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
 type fraudRequest struct {
 	ID              string                  `json:"id"`
@@ -130,12 +137,20 @@ func handleFraudScore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Lê body em buffer poolado (evita alocação do bytes.Buffer a cada request).
+	// go-json é 5-10× mais rápido que encoding/json e usa as interfaces
+	// json.Unmarshaler geradas pelo easyjson nos tipos internos (vector.*).
+	bodyBuf := reqBufPool.Get().(*bytes.Buffer)
+	bodyBuf.Reset()
+	bodyBuf.ReadFrom(r.Body) //nolint:errcheck
 	var req fraudRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := gojson.Unmarshal(bodyBuf.Bytes(), &req); err != nil {
+		reqBufPool.Put(bodyBuf)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(approvedJSON) //nolint:errcheck
 		return
 	}
+	reqBufPool.Put(bodyBuf)
 
 	payload := vector.Payload{
 		Transaction:     req.Transaction,
