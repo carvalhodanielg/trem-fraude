@@ -1,0 +1,7 @@
+{
+    "participants": ["Daniel Carvalho"],
+    "social": ["https://github.com/carvalhodanielg"],
+    "source-code-repo": "https://github.com/carvalhodanielg/trem-fraude",
+    "stack": ["go", "nginx"],
+    "open_to_work": true
+}
