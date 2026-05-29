@@ -9,15 +9,20 @@ import (
 	"encoding/binary"
 	"io"
 	"log"
-	"math"
 	"os"
+	"sync"
 	"time"
 )
 
 const (
 	dim      = 14
-	efSearch = 20 // candidatos na busca do nível 0
+	efSearch = 100 // candidatos na busca do nível 0
 )
+
+// visitedPool reutiliza mapas entre requisições para evitar pressão de GC.
+var visitedPool = sync.Pool{
+	New: func() any { return make(map[int]struct{}, 128) },
+}
 
 // Index é o índice HNSW carregado em memória.
 type Index struct {
@@ -48,7 +53,8 @@ func Load(path string) (*Index, error) {
 	}
 	defer f.Close()
 
-	br := bufio.NewReaderSize(f, 8<<20)
+	// Buffer menor: 512KB economiza ~7.5 MB vs 8 MB durante o loading.
+	br := bufio.NewReaderSize(f, 512<<10)
 
 	r32 := func() uint32 {
 		var buf [4]byte
@@ -62,21 +68,20 @@ func Load(path string) (*Index, error) {
 	entry := int(r32())
 	stride := 2 * M
 
-	// Vetores quantizados
+	// Vetores quantizados — binary.Read lê int8 byte-a-byte sem alocações extras.
 	vectors := make([]int8, N*dim)
-	for i := range vectors {
-		b, _ := br.ReadByte()
-		vectors[i] = int8(b)
+	if err := binary.Read(br, binary.LittleEndian, vectors); err != nil {
+		return nil, err
 	}
 
 	// Labels
 	labels := make([]uint8, N)
 	io.ReadFull(br, labels) //nolint:errcheck
 
-	// Camada 0: stride fixo
+	// Camada 0: stride fixo — leitura em bloco com binary.Read
 	adj0 := make([]uint32, N*stride)
-	for i := range adj0 {
-		adj0[i] = r32()
+	if err := binary.Read(br, binary.LittleEndian, adj0); err != nil {
+		return nil, err
 	}
 	adj0Cnt := make([]uint8, N)
 	io.ReadFull(br, adj0Cnt) //nolint:errcheck
@@ -86,16 +91,16 @@ func Load(path string) (*Index, error) {
 	for l := 1; l < nLayers; l++ {
 		Nl := int(r32())
 		nodes := make([]int32, Nl)
-		for i := range nodes {
-			nodes[i] = int32(r32())
+		if err := binary.Read(br, binary.LittleEndian, nodes); err != nil {
+			return nil, err
 		}
 		off := make([]uint32, Nl+1)
-		for i := range off {
-			off[i] = r32()
+		if err := binary.Read(br, binary.LittleEndian, off); err != nil {
+			return nil, err
 		}
 		nbr := make([]uint32, off[Nl])
-		for i := range nbr {
-			nbr[i] = r32()
+		if err := binary.Read(br, binary.LittleEndian, nbr); err != nil {
+			return nil, err
 		}
 		upper = append(upper, upperLayer{nodes: nodes, off: off, nbr: nbr})
 	}
@@ -127,7 +132,7 @@ func quantizeQuery(q []float32) [dim]int8 {
 			if r > 127 {
 				r = 127
 			}
-			v[i] = int8(math.Round(float64(r)))
+			v[i] = int8(r + 0.5)
 		}
 	}
 	return v
@@ -248,7 +253,11 @@ func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int) []cand {
 	heap.Init(res)
 
 	stride := 2 * idx.m
-	visited := make(map[int]struct{}, ef*4)
+	visited := visitedPool.Get().(map[int]struct{})
+	defer func() {
+		clear(visited)
+		visitedPool.Put(visited)
+	}()
 	visited[ep] = struct{}{}
 
 	for cands.Len() > 0 {
@@ -279,8 +288,8 @@ func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef, k int) []cand {
 		}
 	}
 
-	// Extrai os k melhores em ordem crescente de distância.
-	// O maxCandHeap tem o pior no topo; invertemos para ordenar crescente.
+	// Extrai os k melhores: reverte o heap (máximo no topo → mínimo na frente)
+	// e trunca em k. O(ef) sem alocações extras.
 	slice := []cand(*res)
 	for i, j := 0, len(slice)-1; i < j; i, j = i+1, j-1 {
 		slice[i], slice[j] = slice[j], slice[i]

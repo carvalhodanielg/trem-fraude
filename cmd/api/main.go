@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"sync/atomic"
+	"time"
 
 	"github.com/carvalhodanielg/trem-de-fraude/internal/index"
 	"github.com/carvalhodanielg/trem-de-fraude/internal/vector"
@@ -31,13 +32,22 @@ type fraudResponse struct {
 }
 
 func main() {
-	http.HandleFunc("GET /ready", handleReady)
-	http.HandleFunc("POST /fraud-score", handleFraudScore)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /ready", handleReady)
+	mux.HandleFunc("POST /fraud-score", handleFraudScore)
 
 	go startup()
 
+	srv := &http.Server{
+		Addr:         ":8080",
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
 	log.Println("listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(srv.ListenAndServe())
 }
 
 func startup() {
@@ -71,12 +81,14 @@ func handleReady(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusServiceUnavailable)
 }
 
+var approvedJSON = []byte(`{"approved":true,"fraud_score":0}` + "\n")
+
 func handleFraudScore(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("panic recuperado: %v", rec)
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(fraudResponse{Approved: true, FraudScore: 0.0})
+			w.Write(approvedJSON) //nolint:errcheck
 		}
 	}()
 
@@ -86,14 +98,14 @@ func handleFraudScore(w http.ResponseWriter, r *http.Request) {
 
 	if idx == nil || norm == nil || risk == nil {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(fraudResponse{Approved: true, FraudScore: 0.0})
+		w.Write(approvedJSON) //nolint:errcheck
 		return
 	}
 
 	var req fraudRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(fraudResponse{Approved: true, FraudScore: 0.0})
+		w.Write(approvedJSON) //nolint:errcheck
 		return
 	}
 
@@ -106,11 +118,20 @@ func handleFraudScore(w http.ResponseWriter, r *http.Request) {
 	}
 
 	vec := vector.Vectorize(payload, *norm, *risk)
-	score := idx.Search(vec[:], 5)
+	score := idx.Search(vec[:], 9)
+
+	approved := score < 0.4
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(fraudResponse{
-		Approved:   score < 0.6,
+
+	// Evita alocação de encoder para respostas comuns
+	if approved && score == 0 {
+		w.Write(approvedJSON) //nolint:errcheck
+		return
+	}
+
+	json.NewEncoder(w).Encode(fraudResponse{ //nolint:errcheck
+		Approved:   approved,
 		FraudScore: score,
 	})
 }
