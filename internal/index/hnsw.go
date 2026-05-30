@@ -1,0 +1,652 @@
+// Package index implementa busca HNSW sobre o índice compacto gerado
+// pelo cmd/preprocess. O índice usa vetores quantizados em int8 e
+// adjacência em arrays flat (sem maps).
+// O Load usa mmap(2) para mapear o arquivo diretamente — zero cópia,
+// sem pressão no heap Go nem no GC. Dois containers da mesma imagem Docker
+// (overlayfs) compartilham as mesmas physical pages do page cache.
+package index
+
+import (
+	"encoding/binary"
+	"log"
+	"time"
+	"unsafe"
+)
+
+const (
+	dim      = 14
+	efSearch = 80 // candidatos na busca do nível 0 (stage 2) — era 60
+	efFast   = 40 // busca rápida para casos claros (stage 1) — era 30
+)
+
+// visitedBitset é um bitset reutilizável para rastrear nós visitados no beam search.
+// Usa []uint64 em vez de map para evitar cache misses e pressão de GC.
+// O campo toReset rastreia quais bits foram marcados, permitindo limpeza eficiente
+// (O(nós visitados) em vez de O(N/64) de um memset completo de 375 KB).
+type visitedBitset struct {
+	bits    []uint64
+	toReset []int
+}
+
+// heapBufs mantém os slices dos dois heaps de beam search pré-alocados.
+// Reutilizar esses slices entre requisições elimina alocações no hot path e
+// reduz pressão de GC — crítico com GOMAXPROCS=1.
+// cands: candidatos a explorar (minHeap, cresce até ~stride*efSearch elementos).
+// res:   melhores resultados encontrados (maxHeap, cresce até efSearch elementos).
+type heapBufs struct {
+	cands []cand
+	res   []cand
+}
+
+// Index é o índice HNSW carregado em memória.
+type Index struct {
+	n, m, nLayers, entry int
+
+	// Dados do índice: views zero-cópia sobre o arquivo mmap'd (mmapData).
+	// O GC Go não gerencia nem escaneia o backing array desses slices.
+	vectors []int8       // flat, stride dim: nó i → vectors[i*dim:(i+1)*dim]
+	labels  []uint8      // labels[i] = 0 (legit) ou 1 (fraud)
+	adj0    []byte       // flat, 3 bytes/vizinho (uint24 LE): nó i → adj0[i*stride*3:(i*stride+adj0Cnt[i])*3]
+	adj0Cnt []uint8      // adj0Cnt[i] = vizinhos válidos do nó i na camada 0
+	upper   []upperLayer // upper[l] = camada l+1 do grafo HNSW
+
+	// visited é um canal de bitsets pré-alocados usados no beam search.
+	// Com GOMAXPROCS=1, tamanho 2 é suficiente: 1 em uso + 1 de folga para
+	// preempção assíncrona do scheduler. O canal mantém os bitsets vivos
+	// (evita GC) e fornece backpressure sem deadlock.
+	visited chan *visitedBitset
+
+	// heaps é um canal de heapBufs pré-alocados, mesmo padrão que visited.
+	// Elimina alocações de minCandHeap e maxCandHeap a cada requisição.
+	heaps chan *heapBufs
+
+	// mmapData mantém o slice mmap'd vivo enquanto o Index existir.
+	// Todos os slices de dados acima são views deste slice.
+	mmapData []byte
+}
+
+// upperLayer armazena a adjacência de uma camada superior (l >= 1) em CSR.
+type upperLayer struct {
+	nodes []int32  // nodeIdxs ordenados crescente (Nl entradas)
+	off   []uint32 // offsets CSR (Nl+1 entradas)
+	nbr   []uint32 // vizinhos (off[Nl] entradas)
+}
+
+// Load lê o binário compacto gerado pelo cmd/preprocess via mmap(2).
+//
+// Todos os arrays de dados (vectors, labels, adj0, adj0Cnt, upper CSR) são views
+// zero-cópia do arquivo mapeado — não pressionam o heap Go nem o GC.
+// Dois containers da mesma imagem Docker (overlayfs read-only layer) compartilham
+// as mesmas physical pages do page cache do kernel: ~122 MB pagos uma vez no total.
+//
+// Alinhamento dos uint32/int32 nas camadas superiores garantido porque:
+//   header(16) + vectors(N×14) + labels(N) + adj0(N×stride×3) + adj0Cnt(N)
+//   = 16 + N×(14 + 1 + stride×3 + 1) = 16 + N×(16 + stride×3)
+// Para N=3.000.000, M=3 (stride=6): 16 + N×34 = 102.000.016 ≡ 0 (mod 4). ✓
+// Para N=3.000.000, M=4 (stride=8): 16 + N×40 = 120.000.016 ≡ 0 (mod 4). ✓
+func Load(path string) (*Index, error) {
+	start := time.Now()
+	log.Println("carregando índice HNSW via mmap...")
+
+	data, err := mmapReadOnly(path)
+	if err != nil {
+		return nil, err
+	}
+
+	cur := 0
+	readU32 := func() uint32 {
+		v := binary.LittleEndian.Uint32(data[cur:])
+		cur += 4
+		return v
+	}
+
+	N := int(readU32())
+	M := int(readU32())
+	nLayers := int(readU32())
+	entry := int(readU32())
+	stride := 2 * M
+
+	// Vetores int8 — view direta (alinhamento 1: sempre OK).
+	vectors := unsafe.Slice((*int8)(unsafe.Pointer(&data[cur])), N*dim)
+	cur += N * dim
+
+	// Labels uint8 = byte — slice direto.
+	labels := data[cur : cur+N]
+	cur += N
+
+	// Camada 0: adj0 uint24 — slice direto como []byte.
+	adj0Size := N * stride * 3
+	adj0 := data[cur : cur+adj0Size]
+	cur += adj0Size
+
+	// adj0Cnt uint8 — slice direto.
+	adj0Cnt := data[cur : cur+N]
+	cur += N
+
+	// Camadas superiores (l=1..nLayers-1): CSR com views uint32/int32.
+	// Alinhamento 4 verificado no comentário do Load acima.
+	upper := make([]upperLayer, 0, nLayers-1)
+	for l := 1; l < nLayers; l++ {
+		Nl := int(readU32())
+
+		nodes := unsafe.Slice((*int32)(unsafe.Pointer(&data[cur])), Nl)
+		cur += Nl * 4
+
+		off := unsafe.Slice((*uint32)(unsafe.Pointer(&data[cur])), Nl+1)
+		cur += (Nl + 1) * 4
+
+		nbrCount := int(off[Nl])
+		var nbr []uint32
+		if nbrCount > 0 {
+			nbr = unsafe.Slice((*uint32)(unsafe.Pointer(&data[cur])), nbrCount)
+			cur += nbrCount * 4
+		}
+
+		upper = append(upper, upperLayer{nodes: nodes, off: off, nbr: nbr})
+	}
+
+	log.Printf("índice HNSW carregado: %d nós, M=%d, %d camadas em %s",
+		N, M, nLayers, time.Since(start))
+
+	// Pool tamanho 2: com GOMAXPROCS=1, 1 bitset em uso + 1 folga para
+	// preempção assíncrona do scheduler. Memória: 2×375KB ≈ 750 KB (vs 32×375KB≈12MB antes).
+	bitWords := (N + 63) / 64
+	const poolSize = 2
+	visitedCh := make(chan *visitedBitset, poolSize)
+	for i := 0; i < poolSize; i++ {
+		visitedCh <- &visitedBitset{
+			bits:    make([]uint64, bitWords),
+			toReset: make([]int, 0, 512),
+		}
+	}
+
+	// Pool de heapBufs tamanho 2 pelo mesmo motivo.
+	// cands pode crescer até stride*efSearch elementos; res até efSearch.
+	// Com M=3 ef=80: 6*80+16=496; com M=4 ef=80: 8*80+16=656.
+	candsCap := stride*efSearch + 16
+	const heapPoolSize = 2
+	heapsCh := make(chan *heapBufs, heapPoolSize)
+	for i := 0; i < heapPoolSize; i++ {
+		heapsCh <- &heapBufs{
+			cands: make([]cand, 0, candsCap),
+			res:   make([]cand, 0, efSearch+1),
+		}
+	}
+
+	return &Index{
+		n: N, m: M, nLayers: nLayers, entry: entry,
+		vectors:  vectors,
+		labels:   labels,
+		adj0:     adj0,
+		adj0Cnt:  adj0Cnt,
+		upper:    upper,
+		visited:  visitedCh,
+		heaps:    heapsCh,
+		mmapData: data,
+	}, nil
+}
+
+// vecAt retorna o slice de dim int8 do nó i.
+func (idx *Index) vecAt(i int) []int8 {
+	return idx.vectors[i*dim : (i+1)*dim]
+}
+
+// quantizeQuery converte o vetor de query float32 para [dim]int8.
+func quantizeQuery(q []float32) [dim]int8 {
+	var v [dim]int8
+	for i, x := range q {
+		if x < 0 {
+			v[i] = -1 // sentinela
+		} else {
+			r := x * 127
+			if r > 127 {
+				r = 127
+			}
+			v[i] = int8(r + 0.5)
+		}
+	}
+	return v
+}
+
+// distSq calcula a distância euclidiana ao quadrado em escala int8.
+// Sentinela −1: se ambos são −1 → contribui 0; se só um → contribui 127².
+func distSq(a *[dim]int8, b []int8) int32 {
+	var sum int32
+	for i := 0; i < dim; i++ {
+		ai, bi := int32(a[i]), int32(b[i])
+		if ai < 0 || bi < 0 {
+			if ai != bi {
+				sum += 127 * 127
+			}
+			continue
+		}
+		d := ai - bi
+		sum += d * d
+	}
+	return sum
+}
+
+// distSqFloat calcula a distância euclidiana ao quadrado entre a query float32
+// original e um vetor de referência int8 (promovido para float32).
+// Usada no top-k float32 pós-search para precisão máxima sem custo de memória extra.
+// Sentinela: query[i] < 0 → ambos sentinela: contribui 0; só um: contribui 1.0
+// (equivalente a 127/127 em escala normalizada, sem o 127² do int8).
+func distSqFloat(query []float32, ref []int8) float32 {
+	var sum float32
+	const scale = 1.0 / 127.0
+	for i := 0; i < dim; i++ {
+		qi := query[i]
+		ri := float32(ref[i]) * scale
+		if qi < 0 || ref[i] < 0 {
+			if !(qi < 0 && ref[i] < 0) {
+				sum += 1.0 // penalidade máxima para sentinela misto
+			}
+			continue
+		}
+		d := qi - ri
+		sum += d * d
+	}
+	return sum
+}
+
+// countFraudTopK conta quantos dos k vizinhos mais próximos em h (pool de
+// candidatos do beam search) são fraude. Usa k-seleção por distância int8,
+// que é a mesma métrica do grafo HNSW e da busca — portanto maximamente
+// consistente com o ground truth.
+//
+// Não modifica h — leitura pura, preserva estado para o estágio 2.
+// Usa seleção parcial O(n·k) onde n ≤ efSearch=60, k=5 → O(300), negligível.
+// Sem alocações: array fixo na stack.
+func (idx *Index) countFraudTopK(h []cand, k int) int {
+	n := len(h)
+	if n == 0 {
+		return 0
+	}
+	if n <= k {
+		// Todos os n candidatos estão no top-k.
+		count := 0
+		for _, c := range h {
+			if idx.labels[c.idx] == 1 {
+				count++
+			}
+		}
+		return count
+	}
+
+	// Seleção parcial: mantém os k menores em top[0..k-1] sem alocar.
+	// Array fixo na stack (k ≤ 5).
+	var top [5]cand
+	worstD := int32(-1)
+	worstI := 0
+	filled := 0
+
+	for _, c := range h {
+		if filled < k {
+			top[filled] = c
+			filled++
+			if filled == k {
+				// Inicializa rastreamento do pior no top.
+				worstD, worstI = top[0].d, 0
+				for j := 1; j < k; j++ {
+					if top[j].d > worstD {
+						worstD, worstI = top[j].d, j
+					}
+				}
+			}
+		} else if c.d < worstD {
+			top[worstI] = c
+			worstD, worstI = top[0].d, 0
+			for j := 1; j < k; j++ {
+				if top[j].d > worstD {
+					worstD, worstI = top[j].d, j
+				}
+			}
+		}
+	}
+
+	count := 0
+	for i := 0; i < filled; i++ {
+		if idx.labels[top[i].idx] == 1 {
+			count++
+		}
+	}
+	return count
+}
+
+// topKFraudCountFloat32 seleciona os k vizinhos mais próximos de candidates
+// por distância float32 (query original × referência int8 reconvertida) e conta
+// quantos são fraude. Usada no hot path do stage-2 e disponível para benchmark.
+//
+// Vantagem sobre countFraudTopK (int8): a query não sofre erro de quantização,
+// resultando em apenas uma fonte de erro (a referência int8), contra duas no
+// caso int8 puro. O grafo HNSW foi construído com distância float32 e o ground
+// truth usa float32 brute-force — float32 reranking alinha melhor com o esperado.
+func (idx *Index) topKFraudCountFloat32(query []float32, candidates []cand, k int) int {
+	n := len(candidates)
+	if n == 0 {
+		return 0
+	}
+	if n <= k {
+		count := 0
+		for i := 0; i < n; i++ {
+			if idx.labels[candidates[i].idx] == 1 {
+				count++
+			}
+		}
+		return count
+	}
+	var bestIdx [5]int
+	var bestD [5]float32
+	var worstDf float32
+	worstFi := 0
+	filled := 0
+	for i := 0; i < n; i++ {
+		d := distSqFloat(query, idx.vecAt(candidates[i].idx))
+		if filled < k {
+			bestIdx[filled] = candidates[i].idx
+			bestD[filled] = d
+			filled++
+			if filled == k {
+				worstDf, worstFi = bestD[0], 0
+				for j := 1; j < k; j++ {
+					if bestD[j] > worstDf {
+						worstDf, worstFi = bestD[j], j
+					}
+				}
+			}
+		} else if d < worstDf {
+			bestIdx[worstFi] = candidates[i].idx
+			bestD[worstFi] = d
+			worstDf, worstFi = bestD[0], 0
+			for j := 1; j < k; j++ {
+				if bestD[j] > worstDf {
+					worstDf, worstFi = bestD[j], j
+				}
+			}
+		}
+	}
+	count := 0
+	for i := 0; i < filled; i++ {
+		if idx.labels[bestIdx[i]] == 1 {
+			count++
+		}
+	}
+	return count
+}
+
+// upperPos encontra a posição de nodeIdx em ul.nodes via busca binária.
+// Retorna −1 se não encontrado.
+func upperPos(ul *upperLayer, nodeIdx int) int {
+	lo, hi := 0, len(ul.nodes)-1
+	for lo <= hi {
+		mid := (lo + hi) >> 1
+		v := int(ul.nodes[mid])
+		switch {
+		case v == nodeIdx:
+			return mid
+		case v < nodeIdx:
+			lo = mid + 1
+		default:
+			hi = mid - 1
+		}
+	}
+	return -1
+}
+
+// greedyDescend desce pela camada superior ul a partir de ep,
+// retornando o vizinho mais próximo de q nessa camada.
+func (idx *Index) greedyDescend(ul *upperLayer, ep int, q *[dim]int8) int {
+	best := ep
+	bestD := distSq(q, idx.vecAt(ep))
+
+	for {
+		pos := upperPos(ul, best)
+		if pos < 0 {
+			break
+		}
+		improved := false
+		start, end := ul.off[pos], ul.off[pos+1]
+		for i := start; i < end; i++ {
+			nbr := int(ul.nbr[i])
+			d := distSq(q, idx.vecAt(nbr))
+			if d < bestD {
+				bestD = d
+				best = nbr
+				improved = true
+			}
+		}
+		if !improved {
+			break
+		}
+	}
+	return best
+}
+
+// ── Heaps inline para o beam search (sem container/heap, sem boxing) ─────────
+//
+// Todas as operações são sobre []cand diretamente — sem interface{}, sem boxing,
+// sem dispatch dinâmico. O compilador pode inlinar e vetorizar.
+//
+// minHeap: menor distância no topo (candidatos a explorar).
+// maxHeap: maior distância no topo (janela dos ef melhores resultados).
+
+type cand struct {
+	idx int
+	d   int32
+}
+
+// ── minHeap (candidatos) ──────────────────────────────────────────────────────
+
+func minHeapUp(h []cand, i int) {
+	for i > 0 {
+		parent := (i - 1) >> 1
+		if h[parent].d <= h[i].d {
+			break
+		}
+		h[parent], h[i] = h[i], h[parent]
+		i = parent
+	}
+}
+
+func minHeapDown(h []cand, i, n int) {
+	for {
+		left := (i << 1) + 1
+		if left >= n {
+			break
+		}
+		j := left
+		if right := left + 1; right < n && h[right].d < h[left].d {
+			j = right
+		}
+		if h[i].d <= h[j].d {
+			break
+		}
+		h[i], h[j] = h[j], h[i]
+		i = j
+	}
+}
+
+func minHeapPush(h *[]cand, c cand) {
+	*h = append(*h, c)
+	minHeapUp(*h, len(*h)-1)
+}
+
+func minHeapPop(h *[]cand) cand {
+	n := len(*h) - 1
+	(*h)[0], (*h)[n] = (*h)[n], (*h)[0]
+	minHeapDown(*h, 0, n)
+	x := (*h)[n]
+	*h = (*h)[:n]
+	return x
+}
+
+// ── maxHeap (resultados) ──────────────────────────────────────────────────────
+
+func maxHeapUp(h []cand, i int) {
+	for i > 0 {
+		parent := (i - 1) >> 1
+		if h[parent].d >= h[i].d {
+			break
+		}
+		h[parent], h[i] = h[i], h[parent]
+		i = parent
+	}
+}
+
+func maxHeapDown(h []cand, i, n int) {
+	for {
+		left := (i << 1) + 1
+		if left >= n {
+			break
+		}
+		j := left
+		if right := left + 1; right < n && h[right].d > h[left].d {
+			j = right
+		}
+		if h[i].d >= h[j].d {
+			break
+		}
+		h[i], h[j] = h[j], h[i]
+		i = j
+	}
+}
+
+func maxHeapPush(h *[]cand, c cand) {
+	*h = append(*h, c)
+	maxHeapUp(*h, len(*h)-1)
+}
+
+func maxHeapPop(h *[]cand) cand {
+	n := len(*h) - 1
+	(*h)[0], (*h)[n] = (*h)[n], (*h)[0]
+	maxHeapDown(*h, 0, n)
+	x := (*h)[n]
+	*h = (*h)[:n]
+	return x
+}
+
+// beamSearchLoop executa o loop de beam search na camada 0.
+//
+// Se ep >= 0: inicializa hb.cands/hb.res a partir de ep e marca ep em vbs.
+// Se ep < 0:  continua de onde parou (modo expand — stage-2 continuando stage-1),
+//             reaproveitando hb.cands (fronteira não-explorada) e hb.res (maxHeap atual).
+//
+// Ao retornar, hb.res é um maxHeap válido com até ef melhores candidatos.
+// A finalização (reversão + truncagem) é responsabilidade do chamador.
+func (idx *Index) beamSearchLoop(ep int, q *[dim]int8, ef int, hb *heapBufs, vbs *visitedBitset) {
+	if ep >= 0 {
+		epD := distSq(q, idx.vecAt(ep))
+		hb.cands = append(hb.cands[:0], cand{ep, epD})
+		hb.res = append(hb.res[:0], cand{ep, epD})
+		vbs.bits[ep>>6] |= 1 << uint(ep&63)
+		vbs.toReset = append(vbs.toReset, ep)
+	}
+	// modo expand: hb.cands e hb.res já têm estado do stage anterior.
+
+	stride3 := 2 * idx.m * 3 // bytes por linha do adj0
+
+	for len(hb.cands) > 0 {
+		c := minHeapPop(&hb.cands)
+
+		// Termina se o melhor candidato restante é pior que o pior resultado.
+		if len(hb.res) >= ef && c.d > hb.res[0].d {
+			break
+		}
+
+		cnt := int(idx.adj0Cnt[c.idx])
+		base := c.idx * stride3
+		for j := 0; j < cnt; j++ {
+			p := base + j*3
+			nbr := int(idx.adj0[p]) | int(idx.adj0[p+1])<<8 | int(idx.adj0[p+2])<<16
+			if vbs.bits[nbr>>6]>>uint(nbr&63)&1 != 0 {
+				continue
+			}
+			vbs.bits[nbr>>6] |= 1 << uint(nbr&63)
+			vbs.toReset = append(vbs.toReset, nbr)
+
+			d := distSq(q, idx.vecAt(nbr))
+			if len(hb.res) < ef || d < hb.res[0].d {
+				minHeapPush(&hb.cands, cand{nbr, d})
+				maxHeapPush(&hb.res, cand{nbr, d})
+				if len(hb.res) > ef {
+					maxHeapPop(&hb.res)
+				}
+			}
+		}
+	}
+}
+
+// beamSearchL0 executa beam search na camada 0, gerenciando o reset do vbs.
+//
+// ep >= 0: busca normal — reseta vbs e inicializa a partir do entry point ep.
+// ep < 0:  modo expand — continua de onde stage-1 parou, reutilizando
+//          hb.cands (fronteira não-explorada), hb.res (maxHeap atual) e vbs
+//          intactos. Evita reprocessar nós já visitados.
+//
+// Ao retornar, hb.res é um maxHeap com até ef melhores candidatos.
+// O chamador deve chamar trimAndReturn para obter os k melhores.
+func (idx *Index) beamSearchL0(ep int, q *[dim]int8, ef int, hb *heapBufs, vbs *visitedBitset) {
+	if ep >= 0 {
+		// Modo normal: limpa bits marcados na busca anterior (O(nós visitados)).
+		for _, n := range vbs.toReset {
+			vbs.bits[n>>6] &^= 1 << uint(n&63)
+		}
+		vbs.toReset = vbs.toReset[:0]
+	}
+	// ep < 0: modo expand — vbs, hb.cands e hb.res já têm estado de stage-1.
+	idx.beamSearchLoop(ep, q, ef, hb, vbs)
+}
+
+// Search encontra os k vizinhos mais próximos de query e retorna a fração
+// de vizinhos fraudulentos (fraud score em [0.0, 1.0]).
+//
+// Pipeline de 2 estágios com seleção float32 no stage-2:
+//  1. Estágio 1 (ef=efFast): beam search int8 rápido. Conta fraudes por int8.
+//     Retorno antecipado APENAS para casos absolutamente claros: 0/k ou k/k.
+//  2. Estágio 2 (ef=efSearch): continua de onde stage-1 parou (modo expand),
+//     expande candidatos e seleciona top-k por distância float32 original
+//     (mesma métrica do ground truth — float32 brute-force k=5 da Rinha).
+//
+// Por que stage-2 roda para {1,2,3,4} fraudes (e não só {2,3}):
+//   FN pesa 3× no score. Um resultado de 1/5 de stage-1 pode ser na verdade
+//   3/5 — os vizinhos verdadeiros ainda não foram alcançados com ef=efFast.
+//   Stage-2 (modo expand) não refaz trabalho: retoma a fronteira intacta.
+func (idx *Index) Search(query []float32, k int) float32 {
+	q := quantizeQuery(query)
+	ep := idx.entry
+
+	// Descende pelas camadas superiores (topo → camada 1)
+	for l := len(idx.upper) - 1; l >= 0; l-- {
+		ep = idx.greedyDescend(&idx.upper[l], ep, &q)
+	}
+
+	// Adquire heapBufs e visitedBitset pré-alocados.
+	// Ambos são compartilhados entre stage-1 e stage-2: stage-2 continua
+	// exatamente de onde stage-1 parou (modo expand, ep=-1).
+	hb := <-idx.heaps
+	defer func() { idx.heaps <- hb }()
+
+	vbs := <-idx.visited
+	defer func() { idx.visited <- vbs }()
+
+	// Estágio 1: busca rápida com efFast.
+	idx.beamSearchL0(ep, &q, efFast, hb, vbs)
+
+	// Conta fraudes no top-k por int8 para triagem inicial.
+	// Não modifica hb.res — preserva estado para o estágio 2.
+	fraudCount := idx.countFraudTopK(hb.res, k)
+
+	// Retorno antecipado SOMENTE para casos absolutamente claros (0 ou todos fraude).
+	// Para qualquer outro resultado, stage-2 expande a busca — custo incremental
+	// baixo pois continua da fronteira intacta de stage-1 (modo expand, ep=-1).
+	if fraudCount == 0 || fraudCount == k {
+		return float32(fraudCount) / float32(k)
+	}
+
+	// Estágio 2: continua do estado de stage-1 (ep=-1 → modo expand).
+	// Reutiliza hb.cands (fronteira não-explorada), hb.res e vbs — zero trabalho duplicado.
+	// Seleção final por distância float32: query sem erro de quantização,
+	// alinha com o ground truth (float32 brute-force k=5 da Rinha).
+	idx.beamSearchL0(-1, &q, efSearch, hb, vbs)
+	return float32(idx.topKFraudCountFloat32(query, hb.res, k)) / float32(k)
+}
