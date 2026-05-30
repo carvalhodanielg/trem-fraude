@@ -450,20 +450,16 @@ func (idx *VPIndex) Search(query []float32, k int) float32 {
 	return knn.fraudFraction(idx.labels, k)
 }
 
-// WarmUp pré-carrega páginas de vptree.bin no page cache do OS via buscas reais.
+// WarmUp faz buscas greedy para pré-carregar páginas quentes no page cache.
 //
-// O problema: vptree.bin (~107MB) é mmap'd mas as páginas só entram no cache
-// quando acessadas. Com cold start, as primeiras N requisições sofrem page faults
-// (disk I/O latência ≈ 0.1–1 ms cada) que aumentam o p99 no início do teste.
+// Estratégia: 3000 greedy descents usando vetores reais como query, distribuídos
+// uniformemente. Cada busca acessa depth=16 nós e 1 folha (64 pontos):
+// ~(16×16B + 64×28B) = 2048B de nodes+vectors per busca.
+// 3000 × 2048B ≈ 6MB de páginas acessadas no padrão real de busca.
 //
-// Solução: fazer nWarming buscas greedy usando vetores reais do índice como query,
-// dispersados uniformemente pelo array. Cada busca acessa ~80 pontos e atravessa
-// depth=16 nós internos, cobrindo ≈ 2.5 kB de páginas distintas.
-// Com 3000 buscas: ~7.5 MB de páginas de nodes+vectors acessadas aleatoriamente —
-// suficiente para precarregar os nós raiz (L0–L11) e o path mais quente da árvore.
-//
-// Nota: não faz leitura sequencial de vectors16 (84 MB) para evitar exceder
-// o limite de 170 MB de memória do container.
+// NOTA: NÃO faz leitura sequencial de vectors16 (84MB) — isso causaria cache
+// thrashing ao evitar código Go e páginas HTTP do page cache (contraproducente).
+// As 3000 buscas greedy aquecem as páginas mais quentes (root path, folhas comuns).
 func (idx *VPIndex) WarmUp() {
 	const nWarming = 3000
 	knn := &vpKNN{}

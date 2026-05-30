@@ -90,6 +90,29 @@ func startup() {
 		log.Fatalf("erro ao carregar índice VP-Tree: %v", err)
 	}
 
+	// Estratégia de warm-up para evitar page faults no primeiro teste:
+	//
+	// Problema: vptree.bin (107MB) é mmap'd. Com cold start, as páginas entram
+	// no page cache apenas quando acessadas. O load test começa ~65s após startup
+	// (healthcheck start_period=60s + 5s de lag). Se as páginas forem carregadas
+	// muito cedo, o OS pode evictá-las durante o período de espera de 65s.
+	//
+	// Solução: aguardar 57s, depois fazer WarmUp final (180ms) e marcar ready.
+	// Janela entre warm-up e 1ª requisição: ≈8s → pages ficam quentes.
+	// O start_period=60s garante que healthchecks falhos antes t=60s são ignorados.
+	//
+	// Sequência de tempo:
+	//   t=0s:   startup, LoadVP (mmap sem pré-load)
+	//   t=57s:  WarmUp(): toca 84MB de vectors16 + 3000 buscas (180ms)
+	//   t=57.2s: idxPtr.Store → servidor pronto
+	//   t=60s:  healthcheck passa (start_period termina)
+	//   t=65s:  load test começa (~8s de páginas quentes → sem page faults)
+	log.Println("aguardando warm-up tardio (57s)...")
+	time.Sleep(57 * time.Second)
+	t0 := time.Now()
+	idx.WarmUp()
+	log.Printf("warm-up concluído em %s", time.Since(t0))
+
 	// idx é o último a ser armazenado — é ele que sinaliza que está pronto
 	idxPtr.Store(idx)
 
