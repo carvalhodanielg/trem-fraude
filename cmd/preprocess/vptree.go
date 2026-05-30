@@ -103,11 +103,12 @@ func nthElement(perm []uint32, dists []float32, k int) {
 }
 
 // buildVPTree constrói a VP-Tree a partir dos vetores float32 brutos.
-// Retorna a slice de nós e o array de permutação de índices.
+// seed controla a seleção aleatória de vantage points — seeds diferentes produzem
+// árvores com estruturas diferentes, útil para busca dual-tree.
 //
 // Complexidade de build: O(N log N) — quickselect O(N) por nível × O(log N) níveis.
 // Memória de pico: ~2N floats = ~24 MB para N=3M (alocações por nível, liberadas pelo GC).
-func buildVPTree(vecs [][dim]float32) (nodes []vpBuildNode, perm []uint32) {
+func buildVPTree(vecs [][dim]float32, seed int64) (nodes []vpBuildNode, perm []uint32) {
 	N := len(vecs)
 	perm = make([]uint32, N)
 	for i := range perm {
@@ -116,7 +117,8 @@ func buildVPTree(vecs [][dim]float32) (nodes []vpBuildNode, perm []uint32) {
 	// Estimativa de nós: ~2 × ceil(N/vpLeafSize) para árvore binária balanceada
 	nodes = make([]vpBuildNode, 0, 2*((N+vpLeafSize-1)/vpLeafSize+1))
 
-	buildRec(vecs, perm, 0, N, &nodes)
+	rng := rand.New(rand.NewSource(seed))
+	buildRec(vecs, perm, 0, N, &nodes, rng)
 	return nodes, perm
 }
 
@@ -130,7 +132,7 @@ func buildVPTree(vecs [][dim]float32) (nodes []vpBuildNode, perm []uint32) {
 //   - VP = perm[lo] (selecionado aleatoriamente e movido para lo)
 //   - perm[lo+1 : splitPoint] = pontos com dist(vp,x) ≤ medDist (left)
 //   - perm[splitPoint : hi]   = pontos com dist(vp,x) ≥ medDist (right)
-func buildRec(vecs [][dim]float32, perm []uint32, lo, hi int, nodes *[]vpBuildNode) int32 {
+func buildRec(vecs [][dim]float32, perm []uint32, lo, hi int, nodes *[]vpBuildNode, rng *rand.Rand) int32 {
 	if hi-lo <= vpLeafSize {
 		// Folha: codifica range como valores negativos
 		idx := int32(len(*nodes))
@@ -142,7 +144,7 @@ func buildRec(vecs [][dim]float32, perm []uint32, lo, hi int, nodes *[]vpBuildNo
 	}
 
 	// Seleciona vantage point aleatório em [lo, hi) e move para perm[lo]
-	vpPos := lo + rand.Intn(hi-lo)
+	vpPos := lo + rng.Intn(hi-lo)
 	perm[lo], perm[vpPos] = perm[vpPos], perm[lo]
 	vp := perm[lo]
 
@@ -172,8 +174,8 @@ func buildRec(vecs [][dim]float32, perm []uint32, lo, hi int, nodes *[]vpBuildNo
 	nodeIdx := int32(len(*nodes))
 	*nodes = append(*nodes, vpBuildNode{vpIdx: vp, medDist: medDist})
 
-	leftChild := buildRec(vecs, perm, lo+1, splitPoint, nodes)
-	rightChild := buildRec(vecs, perm, splitPoint, hi, nodes)
+	leftChild := buildRec(vecs, perm, lo+1, splitPoint, nodes, rng)
+	rightChild := buildRec(vecs, perm, splitPoint, hi, nodes, rng)
 
 	// Preenche filhos (slice pode ter crescido, mas índice é estável)
 	(*nodes)[nodeIdx].left = leftChild
@@ -199,13 +201,26 @@ func quantize16(v float32) int16 {
 	return int16(r)
 }
 
-// writeVPTree serializa a VP-Tree em vptree.bin.
+// writeVPTree serializa as duas VP-Trees em vptree.bin (formato dual-tree).
+//
+// Formato do arquivo:
+//
+//	[4] uint32 N             — total de pontos
+//	[4] uint32 nodeCount1    — nós da árvore 1
+//	[4] uint32 leafSize      — threshold de folha
+//	[4] uint32 nodeCount2    — nós da árvore 2 (era "padding")
+//	[nodeCount1 × 16] vpNode — nós da árvore 1
+//	[N × 4] uint32           — perm1
+//	[nodeCount2 × 16] vpNode — nós da árvore 2
+//	[N × 4] uint32           — perm2
+//	[N × dim × 2] int16      — vetores em int16 (alta precisão)
+//
 // Inclui os vetores float32 originais quantizados em int16 (alta precisão)
 // para garantir que as distâncias computadas na busca sejam equivalentes
 // às distâncias float32 brutas (dentro de ±0.000028 em L2 para 14D).
-func writeVPTree(path string, N int, nodes []vpBuildNode, perm []uint32, vecs [][dim]float32) error {
+func writeVPTree(path string, N int, nodes1 []vpBuildNode, perm1 []uint32, nodes2 []vpBuildNode, perm2 []uint32, vecs [][dim]float32) error {
 	start := time.Now()
-	log.Printf("escrevendo VP-Tree em %s (%d nós, %d pontos)...", path, len(nodes), N)
+	log.Printf("escrevendo VP-Tree dual em %s (%d+%d nós, %d pontos)...", path, len(nodes1), len(nodes2), N)
 
 	f, err := os.Create(path)
 	if err != nil {
@@ -233,28 +248,35 @@ func writeVPTree(path string, N int, nodes []vpBuildNode, perm []uint32, vecs []
 		bw.WriteByte(byte(v))
 		bw.WriteByte(byte(v >> 8))
 	}
+	writeNodes := func(nodes []vpBuildNode) {
+		for _, nd := range nodes {
+			write32(nd.vpIdx)
+			writeF32(nd.medDist)
+			writeI32(nd.left)
+			writeI32(nd.right)
+		}
+	}
+	writePerm := func(perm []uint32) {
+		for _, p := range perm {
+			write32(p)
+		}
+	}
 
 	// Cabeçalho (16 bytes)
 	write32(uint32(N))
-	write32(uint32(len(nodes)))
+	write32(uint32(len(nodes1)))
 	write32(vpLeafSize)
-	write32(0) // padding
+	write32(uint32(len(nodes2))) // era "padding=0"
 
-	// Nós (len(nodes) × 16 bytes)
-	for _, nd := range nodes {
-		write32(nd.vpIdx)
-		writeF32(nd.medDist)
-		writeI32(nd.left)
-		writeI32(nd.right)
-	}
+	// Árvore 1: nós + permutação
+	writeNodes(nodes1)
+	writePerm(perm1)
 
-	// Permutação (N × 4 bytes)
-	for _, p := range perm {
-		write32(p)
-	}
+	// Árvore 2: nós + permutação
+	writeNodes(nodes2)
+	writePerm(perm2)
 
 	// Vetores int16 (N × dim × 2 bytes) — alta precisão para busca exata
-	// Alinhamento: offset = 16 + nodeCount*16 + N*4 — múltiplo de 4 (N par) ✓
 	for _, v := range vecs {
 		for _, x := range v {
 			writeI16(quantize16(x))
@@ -266,7 +288,7 @@ func writeVPTree(path string, N int, nodes []vpBuildNode, perm []uint32, vecs []
 	}
 
 	stat, _ := os.Stat(path)
-	log.Printf("VP-Tree salva: %s (%.1f MB) em %s",
+	log.Printf("VP-Tree dual salva: %s (%.1f MB) em %s",
 		path, float64(stat.Size())/1024/1024, time.Since(start))
 	return nil
 }

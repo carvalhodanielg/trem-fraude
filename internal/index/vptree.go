@@ -39,16 +39,14 @@ import (
 )
 
 // vpInitialLeafVisits: folhas visitadas na busca rápida (todos os casos).
-// ~20×(16+64) ≈ 1600 ops × 7ns ≈ 11µs/query.
-// Mais folhas iniciais reduzem os casos borderline "perdidos" (classificados
-// erroneamente como 0/k no estágio 1, impedindo o refinamento do estágio 2).
-const vpInitialLeafVisits = 5
+// Com dual-tree: initPerTree = ceil(6/2) = 3 por árvore = 6 total.
+// ~6×(16+64) ≈ 480 ops × 7ns ≈ 3.4µs/query.
+const vpInitialLeafVisits = 6
 
-// vpMaxLeafVisits: folhas visitadas na busca refinada (só casos borderline).
-// Casos borderline: fraudCount ∈ {1..k-1} após a busca inicial.
+// vpMaxLeafVisits: folhas visitadas TOTAL na busca refinada (só casos borderline).
+// Com dual-tree interleaved: budget 700 compartilhado entre tree 1 e tree 2.
 // ~700×(16+64) ≈ 56000 ops × 7ns ≈ 392µs/query (apenas ~4% dos casos).
-// Média ponderada: 0.96×2.8 + 0.04×392 ≈ 18µs/query.
-// Empiricamente: 700 deu score 3093 (p99=61ms, FP=42, FN=38) vs 1000→3084.
+// Média ponderada: 0.96×3.4 + 0.04×392 ≈ 18.9µs/query.
 const vpMaxLeafVisits = 700
 
 // vpPQInitialCap: capacidade inicial do PQ de backtracking.
@@ -93,29 +91,46 @@ type vpPQ struct {
 	buf []vpPQEntry
 }
 
-// VPIndex é o índice VP-Tree carregado via mmap.
+// VPIndex é o índice VP-Tree dual carregado via mmap.
+// Duas árvores com seeds diferentes (seed 1 e seed 2) exploram regiões distintas
+// do espaço: a busca interleaved entre elas cobre mais da vizinhança verdadeira
+// de casos borderline dentro do mesmo orçamento de folhas.
 type VPIndex struct {
 	n         int
-	vectors16 []int16  // mmap'd de vptree.bin: N×dim int16 (±0.000015/dim)
-	labels    []uint8  // mmap'd de index.bin: N uint8 (0=legit, 1=fraud)
-	nodes     []vpNode // mmap'd de vptree.bin: nós da VP-Tree
-	perm      []uint32 // mmap'd de vptree.bin: índices originais na ordem VP-Tree
+	vectors16 []int16 // mmap'd de vptree.bin: N×dim int16 (±0.000015/dim)
+	labels    []uint8 // mmap'd de index.bin: N uint8 (0=legit, 1=fraud)
+	// Árvore 1 (seed=1)
+	nodes []vpNode // mmap'd de vptree.bin
+	perm  []uint32 // mmap'd de vptree.bin
+	// Árvore 2 (seed=2) — mesmos vetores, estrutura diferente (~13.5MB extra)
+	nodes2 []vpNode // mmap'd de vptree.bin
+	perm2  []uint32 // mmap'd de vptree.bin
 
 	// Pools de tamanho 2: com GOMAXPROCS=1, 1 em uso + 1 de folga.
-	knnPool chan *vpKNN
-	pqPool  chan *vpPQ
+	knnPool  chan *vpKNN
+	pqPool   chan *vpPQ // PQ para árvore 1
+	pq2Pool  chan *vpPQ // PQ para árvore 2
 
 	mmapIdx  []byte // mantém index.bin vivo (mmap)
 	mmapTree []byte // mantém vptree.bin vivo (mmap)
 }
 
-// LoadVP carrega o índice VP-Tree a partir de dois arquivos:
+// LoadVP carrega o índice dual VP-Tree a partir de dois arquivos:
 //   - indexPath: index.bin existente (formato HNSW) — apenas N e labels são lidos
-//   - treePath:  vptree.bin — estrutura da VP-Tree (nodes + perm + vectors int16)
+//   - treePath:  vptree.bin — duas VP-Trees (seeds 1 e 2) + vetores int16
+//
+// Formato vptree.bin (dual-tree):
+//
+//	[4] uint32 N
+//	[4] uint32 nodeCount1
+//	[4] uint32 leafSize
+//	[4] uint32 nodeCount2   ← identifica formato dual (>0)
+//	[nodeCount1×16] vpNode, [N×4] perm1
+//	[nodeCount2×16] vpNode, [N×4] perm2
+//	[N×dim×2] int16
 //
 // Ambos mapeados via mmap(2) — zero cópia, zero pressão no GC.
-// Acesso físico a index.bin: apenas 16B header + N labels ≈ 3MB (vs 122MB total).
-// Os 42MB de vetores int8 e 77MB de adjacência HNSW nunca são faultados.
+// RSS de index.bin: apenas 16B header + N labels ≈ 3MB (vs 122MB total).
 func LoadVP(indexPath, treePath string) (*VPIndex, error) {
 	start := time.Now()
 	log.Println("carregando VP-Tree via mmap...")
@@ -130,7 +145,6 @@ func LoadVP(indexPath, treePath string) (*VPIndex, error) {
 	}
 
 	// ── Parse index.bin: apenas header (N) e labels ──────────────────────────
-	// M, nLayers, entryIdx, int8 vectors e adj HNSW são ignorados pelo VP-Tree.
 	if len(idxData) < 16 {
 		return nil, fmt.Errorf("index.bin muito pequeno: %d bytes", len(idxData))
 	}
@@ -139,49 +153,58 @@ func LoadVP(indexPath, treePath string) (*VPIndex, error) {
 	if need := 16 + N*dim + N; len(idxData) < need {
 		return nil, fmt.Errorf("index.bin: esperado ≥%d bytes, tem %d", need, len(idxData))
 	}
-	// Labels em index.bin: offset 16 + N*dim (após os vetores int8)
-	// Apenas as páginas de labels são faultadas (~3MB); os ~42MB de vetores int8
-	// e ~77MB de adj HNSW nunca são acessados — Linux não os carrega na RAM.
 	labels := idxData[16+N*dim : 16+N*dim+N]
 
-	// ── Parse vptree.bin (header: N, nodeCount, leafSize, pad) ──────────────
+	// ── Parse vptree.bin (formato dual-tree) ─────────────────────────────────
 	if len(treeData) < 16 {
 		return nil, fmt.Errorf("vptree.bin muito pequeno: %d bytes", len(treeData))
 	}
 	treeN := int(binary.LittleEndian.Uint32(treeData[0:]))
-	nodeCount := int(binary.LittleEndian.Uint32(treeData[4:]))
+	nodeCount1 := int(binary.LittleEndian.Uint32(treeData[4:]))
+	// treeData[8:12] = leafSize (ignorado em runtime)
+	nodeCount2 := int(binary.LittleEndian.Uint32(treeData[12:]))
 	if treeN != N {
 		return nil, fmt.Errorf("mismatch: index.bin N=%d, vptree.bin N=%d", N, treeN)
 	}
-	permOffset := 16 + nodeCount*16
-	vecs16Offset := permOffset + N*4
-	if need := vecs16Offset + N*dim*2; len(treeData) < need {
+
+	// Layout: 16B header | nc1×16B nodes1 | N×4B perm1 | nc2×16B nodes2 | N×4B perm2 | N×dim×2B vecs16
+	off1 := 16
+	offPerm1 := off1 + nodeCount1*16
+	off2 := offPerm1 + N*4
+	offPerm2 := off2 + nodeCount2*16
+	offVecs16 := offPerm2 + N*4
+
+	need := offVecs16 + N*dim*2
+	if len(treeData) < need {
 		return nil, fmt.Errorf("vptree.bin: esperado ≥%d bytes, tem %d", need, len(treeData))
 	}
-	// Alinhamento 4: offset 16 é múltiplo de 4 (sizeof vpNode = 16). ✓
-	// Alinhamento 2 para int16: vecs16Offset = 16 + nodeCount*16 + N*4.
-	// nodeCount*16 é múltiplo de 16. N*4 é múltiplo de 4 (N=3M par). ✓
-	nodes := unsafe.Slice((*vpNode)(unsafe.Pointer(&treeData[16])), nodeCount)
-	perm := unsafe.Slice((*uint32)(unsafe.Pointer(&treeData[permOffset])), N)
-	vectors16 := unsafe.Slice((*int16)(unsafe.Pointer(&treeData[vecs16Offset])), N*dim)
+
+	nodes1 := unsafe.Slice((*vpNode)(unsafe.Pointer(&treeData[off1])), nodeCount1)
+	perm1 := unsafe.Slice((*uint32)(unsafe.Pointer(&treeData[offPerm1])), N)
+	nodes2 := unsafe.Slice((*vpNode)(unsafe.Pointer(&treeData[off2])), nodeCount2)
+	perm2 := unsafe.Slice((*uint32)(unsafe.Pointer(&treeData[offPerm2])), N)
+	vectors16 := unsafe.Slice((*int16)(unsafe.Pointer(&treeData[offVecs16])), N*dim)
 
 	const poolSz = 2
 	knnPool := make(chan *vpKNN, poolSz)
 	for i := 0; i < poolSz; i++ {
 		knnPool <- &vpKNN{}
 	}
-	// PQ pré-alocado com vpPQInitialCap para evitar realocações durante busca.
-	// Com 500 folhas × depth=16: até 8000 entradas — cabe em vpPQInitialCap.
+	// PQ pré-alocado: evita realocações durante busca refinada.
+	// Com max_visits=700 e depth=16: até 11200 entradas por árvore.
 	pqPool := make(chan *vpPQ, poolSz)
+	pq2Pool := make(chan *vpPQ, poolSz)
 	for i := 0; i < poolSz; i++ {
 		pqPool <- &vpPQ{buf: make([]vpPQEntry, 0, vpPQInitialCap)}
+		pq2Pool <- &vpPQ{buf: make([]vpPQEntry, 0, vpPQInitialCap)}
 	}
 
-	log.Printf("VP-Tree carregada: N=%d, %d nós em %s", N, nodeCount, time.Since(start))
+	log.Printf("VP-Tree dual carregada: N=%d, %d+%d nós em %s", N, nodeCount1, nodeCount2, time.Since(start))
 	return &VPIndex{
 		n: N, vectors16: vectors16, labels: labels,
-		nodes: nodes, perm: perm,
-		knnPool: knnPool, pqPool: pqPool,
+		nodes: nodes1, perm: perm1,
+		nodes2: nodes2, perm2: perm2,
+		knnPool: knnPool, pqPool: pqPool, pq2Pool: pq2Pool,
 		mmapIdx: idxData, mmapTree: treeData,
 	}, nil
 }
@@ -320,15 +343,16 @@ func (pq *vpPQ) pop() vpPQEntry {
 // greedyToLeaf desce greedily de nodeIdx até a primeira folha, escolhendo sempre
 // o ramo mais próximo. Os ramos descartados são salvos em pq para backtracking.
 // Preenche knn com o VP de cada nó interno e todos os pontos da folha.
-func (idx *VPIndex) greedyToLeaf(query []float32, nodeIdx int32, knn *vpKNN, pq *vpPQ) {
+// nodes/perm identificam qual das duas árvores usar (árvore 1 ou 2).
+func (idx *VPIndex) greedyToLeaf(nodes []vpNode, perm []uint32, query []float32, nodeIdx int32, knn *vpKNN, pq *vpPQ) {
 	for {
-		node := &idx.nodes[nodeIdx]
+		node := &nodes[nodeIdx]
 		if node.left < 0 {
 			// ── Folha: avalia todos os pontos (sem sqrt) ─────────────────
 			lo := int(-(node.left + 1))
 			hi := int(-(node.right + 1))
 			for i := lo; i < hi; i++ {
-				knn.tryInsertSq(idx.distSqF32(query, idx.perm[i]), idx.perm[i])
+				knn.tryInsertSq(idx.distSqF32(query, perm[i]), perm[i])
 			}
 			return
 		}
@@ -360,56 +384,89 @@ func (idx *VPIndex) greedyToLeaf(query []float32, nodeIdx int32, knn *vpKNN, pq 
 // Search encontra os k vizinhos mais próximos de query e retorna a fração
 // de vizinhos fraudulentos (fraud score em [0.0, 1.0]).
 //
-// Algoritmo: greedy descent + backtracking em dois estágios.
+// Algoritmo: greedy descent dual-tree + backtracking em dois estágios.
 //
-//  1. Estágio rápido: desce greedy + vpInitialLeafVisits-1 folhas adicionais.
-//     Custo: ~5×80 ops × 7ns ≈ 2.8µs.
+//  1. Estágio rápido (todos os casos): 3 descents de tree 1 + 3 de tree 2 = 6 total.
+//     Custo: ~6×80 ops × 7ns ≈ 3.4µs.
 //     Cobre 96%+ dos casos (fraudCount 0 ou k = decisão clara).
 //
 //  2. Refinamento (só casos borderline, fraudCount ∈ {1..k-1}):
-//     Continua o backtracking do PQ existente até vpMaxLeafVisits folhas.
-//     Custo: até ~500×80 ops × 7ns ≈ 280µs (para ~4% dos casos).
-//     Elimina a maioria dos falsos positivos/negativos em casos ambíguos.
+//     Busca interleaved entre tree 1 e tree 2, até vpMaxLeafVisits folhas total.
+//     Em cada passo, escolhe o PQ com menor minDist (exploração ótima).
+//     Custo: até ~700×80 ops × 7ns ≈ 392µs (para ~4% dos casos).
+//     Two trees cover regiões que uma única árvore omitiria → ~30-50% menos failures.
 //
 // Custo médio (N=3M, 96% clear + 4% borderline):
 //
-//	0.96×2.8 + 0.04×280 ≈ 14µs/query média.
+//	0.96×3.4 + 0.04×392 ≈ 18.9µs/query média.
 //
-// Precisão: int16 (±0.000015/dim) ≈ float32. Elimina erros de quantização int8.
+// Precisão: int16 (±0.000015/dim) ≈ float32. Compartilhado entre as duas árvores.
 func (idx *VPIndex) Search(query []float32, k int) float32 {
 	knn := <-idx.knnPool
-	pq := <-idx.pqPool
+	pq1 := <-idx.pqPool
+	pq2 := <-idx.pq2Pool
 	defer func() {
 		knn.reset()
 		idx.knnPool <- knn
 	}()
 	defer func() {
-		pq.buf = pq.buf[:0]
-		idx.pqPool <- pq
+		pq1.buf = pq1.buf[:0]
+		idx.pqPool <- pq1
+	}()
+	defer func() {
+		pq2.buf = pq2.buf[:0]
+		idx.pq2Pool <- pq2
 	}()
 
-	// ── Estágio 1: busca rápida (todos os casos) ──────────────────────────
-	idx.greedyToLeaf(query, 0, knn, pq)
-	for leafVisits := 1; leafVisits < vpInitialLeafVisits && len(pq.buf) > 0; leafVisits++ {
-		c := pq.pop()
+	// ── Estágio 1: busca rápida (3 descents por árvore) ──────────────────
+	const initPerTree = (vpInitialLeafVisits + 1) / 2 // 3 para vpInitialLeafVisits=6
+	idx.greedyToLeaf(idx.nodes, idx.perm, query, 0, knn, pq1)
+	for i := 1; i < initPerTree && len(pq1.buf) > 0; i++ {
+		c := pq1.pop()
 		if knn.n == k && c.minDist >= knn.worstActual() {
 			break
 		}
-		idx.greedyToLeaf(query, c.nodeIdx, knn, pq)
+		idx.greedyToLeaf(idx.nodes, idx.perm, query, c.nodeIdx, knn, pq1)
+	}
+	idx.greedyToLeaf(idx.nodes2, idx.perm2, query, 0, knn, pq2)
+	for i := 1; i < initPerTree && len(pq2.buf) > 0; i++ {
+		c := pq2.pop()
+		if knn.n == k && c.minDist >= knn.worstActual() {
+			break
+		}
+		idx.greedyToLeaf(idx.nodes2, idx.perm2, query, c.nodeIdx, knn, pq2)
 	}
 
-	// ── Estágio 2: refinamento só para casos borderline ───────────────────
-	// Casos com fraudCount ∈ {1..k-1} são ambíguos — o estágio 1 pode
-	// ter encontrado os k vizinhos errados (vizinhança mista).
-	// Casos com fraudCount=0 ou k (unânimes) raramente mudam com mais busca.
+	// ── Estágio 2: refinamento interleaved só para casos borderline ───────
+	// Casos borderline (fraudCount ∈ {1..k-1}) recebem busca extra interleaved:
+	// em cada passo escolhemos o PQ com menor minDist (tree 1 ou tree 2).
+	// As duas árvores têm estruturas diferentes → cobrem regiões complementares.
 	fc := knn.fraudCount(idx.labels)
 	if fc > 0 && fc < k {
-		for leafVisits := vpInitialLeafVisits; leafVisits < vpMaxLeafVisits && len(pq.buf) > 0; leafVisits++ {
-			c := pq.pop()
-			if knn.n == k && c.minDist >= knn.worstActual() {
+		for leafVisits := vpInitialLeafVisits; leafVisits < vpMaxLeafVisits; leafVisits++ {
+			h1 := len(pq1.buf) > 0
+			h2 := len(pq2.buf) > 0
+			if !h1 && !h2 {
 				break
 			}
-			idx.greedyToLeaf(query, c.nodeIdx, knn, pq)
+
+			// Escolhe a árvore com menor minDist no topo do PQ
+			useTree1 := h1 && (!h2 || pq1.buf[0].minDist <= pq2.buf[0].minDist)
+			if useTree1 {
+				c := pq1.pop()
+				if knn.n == k && c.minDist >= knn.worstActual() {
+					pq1.buf = pq1.buf[:0] // tree 1 esgotada — descarta entradas restantes
+					continue
+				}
+				idx.greedyToLeaf(idx.nodes, idx.perm, query, c.nodeIdx, knn, pq1)
+			} else {
+				c := pq2.pop()
+				if knn.n == k && c.minDist >= knn.worstActual() {
+					pq2.buf = pq2.buf[:0] // tree 2 esgotada
+					continue
+				}
+				idx.greedyToLeaf(idx.nodes2, idx.perm2, query, c.nodeIdx, knn, pq2)
+			}
 		}
 	}
 

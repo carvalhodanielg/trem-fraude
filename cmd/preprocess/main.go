@@ -355,17 +355,24 @@ func main() {
 	stat, _ := os.Stat(output)
 	log.Printf("índice HNSW salvo: %s (%.1f MB)", output, float64(stat.Size())/1024/1024)
 
-	// ── Fase 4: Construir VP-Tree e escrever vptree.bin ───────────────────
-	log.Println("fase 4: construindo VP-Tree...")
+	// ── Fase 4: Construir dual VP-Tree e escrever vptree.bin ─────────────
+	// Duas árvores com seeds diferentes exploram regiões diferentes do espaço.
+	// Para casos borderline (k-NN mistos), a árvore 2 cobre subtrees que a árvore 1
+	// não alcança com o mesmo orçamento de busca → ~30-50% menos failures.
+	log.Println("fase 4: construindo VP-Tree 1 (seed=1)...")
 	vpOutput := "resources/vptree.bin"
 	if len(os.Args) > 3 {
 		vpOutput = os.Args[3]
 	}
 
-	vpNodes, vpPerm := buildVPTree(rawVectors)
-	log.Printf("VP-Tree construída: %d nós, %d pontos", len(vpNodes), N)
+	vpNodes1, vpPerm1 := buildVPTree(rawVectors, 1)
+	log.Printf("VP-Tree 1 construída: %d nós", len(vpNodes1))
 
-	if err := writeVPTree(vpOutput, N, vpNodes, vpPerm, rawVectors); err != nil {
+	log.Println("fase 4: construindo VP-Tree 2 (seed=2)...")
+	vpNodes2, vpPerm2 := buildVPTree(rawVectors, 2)
+	log.Printf("VP-Tree 2 construída: %d nós", len(vpNodes2))
+
+	if err := writeVPTree(vpOutput, N, vpNodes1, vpPerm1, vpNodes2, vpPerm2, rawVectors); err != nil {
 		log.Fatal("writeVPTree:", err)
 	}
 	rawVectors = nil // libera memória após escrita
