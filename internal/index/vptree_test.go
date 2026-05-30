@@ -9,6 +9,21 @@ import (
 	"testing"
 )
 
+// quantize16Test converte float32 → int16 para testes (mesma lógica do preprocess).
+func quantize16Test(v float32) int16 {
+	if v < -0.5 {
+		return -1
+	}
+	if v < 0 {
+		return 0
+	}
+	r := math.Round(float64(v) * 32767)
+	if r > 32767 {
+		r = 32767
+	}
+	return int16(r)
+}
+
 const vpTreePath = "../../resources/vptree.bin"
 
 // openVPIndex carrega o índice VP-Tree ou pula o teste se os arquivos não existirem.
@@ -273,19 +288,11 @@ func buildVPIndexInMemory(vecs [][dim]float32, labels []uint8) *VPIndex {
 		}
 	}
 
-	// Quantiza vetores para int8
-	quantVecs := make([]int8, N*dim)
+	// Quantiza vetores para int16 (alta precisão)
+	quantVecs16 := make([]int16, N*dim)
 	for i, v := range vecs {
 		for j, x := range v {
-			if x < 0 {
-				quantVecs[i*dim+j] = -1
-			} else {
-				r := x * 127
-				if r > 127 {
-					r = 127
-				}
-				quantVecs[i*dim+j] = int8(r + 0.5)
-			}
+			quantVecs16[i*dim+j] = quantize16Test(x)
 		}
 	}
 
@@ -296,13 +303,13 @@ func buildVPIndexInMemory(vecs [][dim]float32, labels []uint8) *VPIndex {
 	pqPool <- &vpPQ{buf: make([]vpPQEntry, 0, 512)}
 
 	return &VPIndex{
-		n:       N,
-		vectors: quantVecs,
-		labels:  labels,
-		nodes:   vpNodes,
-		perm:    perm,
-		knnPool: knnPool,
-		pqPool:  pqPool,
+		n:         N,
+		vectors16: quantVecs16,
+		labels:    labels,
+		nodes:     vpNodes,
+		perm:      perm,
+		knnPool:   knnPool,
+		pqPool:    pqPool,
 	}
 }
 

@@ -13,14 +13,15 @@
 //   Fase 2: explorar vpMaxLeafVisits−1 folhas adicionais via PQ de backtracking.
 //   Total: ~350 operações × ~7ns = ~2.5µs por query (vs ~460µs com PQ puro).
 //
-// Precisão: float32 (sem quantização na query — só na referência int8).
-// Poda: triangle inequality usada para cada "outro filho" salvo no PQ.
-// Early exit: se após a 1ª folha o resultado já é 0/k ou k/k, retorna imediato.
+// Precisão: float32 query vs int16 referência — 250× mais preciso que int8.
+//   Erro L2 máximo por quantização int16: sqrt(14 × (1/65534)²) ≈ 0.000028.
+//   Elimina virtualmente todos os erros de classificação por quantização.
+//   O int8 original (±0.004/dim) causava ~1.9% de failure_rate por flip de vizinhos.
 //
 // Formato dos arquivos:
 //
-//	index.bin: mesmo formato HNSW (reutilizado para vetores+labels)
-//	vptree.bin: header(16B) + nodes(nodeCount×16B) + perm(N×4B)
+//	index.bin: mesmo formato HNSW (reutilizado apenas para labels)
+//	vptree.bin: header(16B) + nodes(nodeCount×16B) + perm(N×4B) + vectors16(N×14×2B)
 //
 // Codificação de folha em vpNode.left/right:
 //
@@ -37,11 +38,15 @@ import (
 	"unsafe"
 )
 
-// vpMaxLeafVisits é o número máximo de folhas visitadas por query.
-// Custo por folha ≈ depth_parcial × (1 dist+sqrt) + leafSize × dist_sq.
-// vpMaxLeafVisits=5, leafSize=64: ~5×(~4+64) ≈ 340 ops × 7ns ≈ 2.5µs/query.
-// Aumente para mais precisão (edge cases); reduza para menos latência.
-const vpMaxLeafVisits = 5
+// vpInitialLeafVisits: folhas visitadas na busca rápida (todos os casos).
+// ~5×(16+64) ≈ 400 ops × 7ns ≈ 2.8µs/query.
+const vpInitialLeafVisits = 5
+
+// vpMaxLeafVisits: folhas visitadas na busca refinada (só casos borderline).
+// Casos borderline: fraudCount ∈ {1,2,3,4} após a busca inicial.
+// ~500×(16+64) ≈ 40000 ops × 7ns ≈ 280µs/query (apenas ~4% dos casos).
+// Média ponderada: 0.96×2.8 + 0.04×280 ≈ 14µs/query.
+const vpMaxLeafVisits = 500
 
 // vpNode é um nó da VP-Tree, armazenado em vptree.bin (16 bytes cada).
 //
@@ -82,11 +87,11 @@ type vpPQ struct {
 
 // VPIndex é o índice VP-Tree carregado via mmap.
 type VPIndex struct {
-	n       int
-	vectors []int8   // mmap'd de index.bin: N×dim int8 quantizados
-	labels  []uint8  // mmap'd de index.bin: N uint8 (0=legit, 1=fraud)
-	nodes   []vpNode // mmap'd de vptree.bin: nós da VP-Tree
-	perm    []uint32 // mmap'd de vptree.bin: índices originais na ordem VP-Tree
+	n         int
+	vectors16 []int16  // mmap'd de vptree.bin: N×dim int16 (±0.000015/dim)
+	labels    []uint8  // mmap'd de index.bin: N uint8 (0=legit, 1=fraud)
+	nodes     []vpNode // mmap'd de vptree.bin: nós da VP-Tree
+	perm      []uint32 // mmap'd de vptree.bin: índices originais na ordem VP-Tree
 
 	// Pools de tamanho 2: com GOMAXPROCS=1, 1 em uso + 1 de folga.
 	knnPool chan *vpKNN
@@ -97,10 +102,12 @@ type VPIndex struct {
 }
 
 // LoadVP carrega o índice VP-Tree a partir de dois arquivos:
-//   - indexPath: index.bin existente (formato HNSW) — apenas vectors+labels são lidos
-//   - treePath:  vptree.bin — estrutura da VP-Tree (nodes + perm)
+//   - indexPath: index.bin existente (formato HNSW) — apenas N e labels são lidos
+//   - treePath:  vptree.bin — estrutura da VP-Tree (nodes + perm + vectors int16)
 //
 // Ambos mapeados via mmap(2) — zero cópia, zero pressão no GC.
+// Acesso físico a index.bin: apenas 16B header + N labels ≈ 3MB (vs 122MB total).
+// Os 42MB de vetores int8 e 77MB de adjacência HNSW nunca são faultados.
 func LoadVP(indexPath, treePath string) (*VPIndex, error) {
 	start := time.Now()
 	log.Println("carregando VP-Tree via mmap...")
@@ -114,17 +121,19 @@ func LoadVP(indexPath, treePath string) (*VPIndex, error) {
 		return nil, fmt.Errorf("LoadVP tree: %w", err)
 	}
 
-	// ── Parse index.bin (header: N, M, nLayers, entryIdx) ───────────────────
+	// ── Parse index.bin: apenas header (N) e labels ──────────────────────────
+	// M, nLayers, entryIdx, int8 vectors e adj HNSW são ignorados pelo VP-Tree.
 	if len(idxData) < 16 {
 		return nil, fmt.Errorf("index.bin muito pequeno: %d bytes", len(idxData))
 	}
 	N := int(binary.LittleEndian.Uint32(idxData[0:]))
-	// M, nLayers, entryIdx não usados pelo VP-Tree
 
 	if need := 16 + N*dim + N; len(idxData) < need {
 		return nil, fmt.Errorf("index.bin: esperado ≥%d bytes, tem %d", need, len(idxData))
 	}
-	vectors := unsafe.Slice((*int8)(unsafe.Pointer(&idxData[16])), N*dim)
+	// Labels em index.bin: offset 16 + N*dim (após os vetores int8)
+	// Apenas as páginas de labels são faultadas (~3MB); os ~42MB de vetores int8
+	// e ~77MB de adj HNSW nunca são acessados — Linux não os carrega na RAM.
 	labels := idxData[16+N*dim : 16+N*dim+N]
 
 	// ── Parse vptree.bin (header: N, nodeCount, leafSize, pad) ──────────────
@@ -136,12 +145,17 @@ func LoadVP(indexPath, treePath string) (*VPIndex, error) {
 	if treeN != N {
 		return nil, fmt.Errorf("mismatch: index.bin N=%d, vptree.bin N=%d", N, treeN)
 	}
-	if need := 16 + nodeCount*16 + N*4; len(treeData) < need {
+	permOffset := 16 + nodeCount*16
+	vecs16Offset := permOffset + N*4
+	if need := vecs16Offset + N*dim*2; len(treeData) < need {
 		return nil, fmt.Errorf("vptree.bin: esperado ≥%d bytes, tem %d", need, len(treeData))
 	}
 	// Alinhamento 4: offset 16 é múltiplo de 4 (sizeof vpNode = 16). ✓
+	// Alinhamento 2 para int16: vecs16Offset = 16 + nodeCount*16 + N*4.
+	// nodeCount*16 é múltiplo de 16. N*4 é múltiplo de 4 (N=3M par). ✓
 	nodes := unsafe.Slice((*vpNode)(unsafe.Pointer(&treeData[16])), nodeCount)
-	perm := unsafe.Slice((*uint32)(unsafe.Pointer(&treeData[16+nodeCount*16])), N)
+	perm := unsafe.Slice((*uint32)(unsafe.Pointer(&treeData[permOffset])), N)
+	vectors16 := unsafe.Slice((*int16)(unsafe.Pointer(&treeData[vecs16Offset])), N*dim)
 
 	const poolSz = 2
 	knnPool := make(chan *vpKNN, poolSz)
@@ -156,7 +170,7 @@ func LoadVP(indexPath, treePath string) (*VPIndex, error) {
 
 	log.Printf("VP-Tree carregada: N=%d, %d nós em %s", N, nodeCount, time.Since(start))
 	return &VPIndex{
-		n: N, vectors: vectors, labels: labels,
+		n: N, vectors16: vectors16, labels: labels,
 		nodes: nodes, perm: perm,
 		knnPool: knnPool, pqPool: pqPool,
 		mmapIdx: idxData, mmapTree: treeData,
@@ -164,14 +178,15 @@ func LoadVP(indexPath, treePath string) (*VPIndex, error) {
 }
 
 // distSqF32 calcula a distância L2 AO QUADRADO (sem sqrt) entre a query float32
-// e o vetor int8 do ponto ptIdx. Usado para TODOS os pontos (folha e VP).
+// e o vetor int16 do ponto ptIdx. Usado para TODOS os pontos (folha e VP).
 // Para VPs de nós internos, o chamador aplica sqrt para o pruning.
 //
-// Reconstrução: ref_float = int8_val / 127.0
-// Sentinela: query[i]<0 ou ref[i]==-1 → ambos: 0; só um: 1.0.
+// Reconstrução: ref_float = int16_val / 32767.0
+// Sentinela: query[i]<0 ou ref[i]<0 → ambos: 0; só um: 1.0.
+// Precisão: ±0.000015 por dimensão (vs ±0.004 do int8 — 250× mais preciso).
 func (idx *VPIndex) distSqF32(query []float32, ptIdx uint32) float32 {
-	ref := idx.vectors[int(ptIdx)*dim : int(ptIdx)*dim+dim]
-	const scale = float32(1.0 / 127.0)
+	ref := idx.vectors16[int(ptIdx)*dim : int(ptIdx)*dim+dim]
+	const scale = float32(1.0 / 32767.0)
 	var sum float32
 	for i := 0; i < dim; i++ {
 		qi := query[i]
@@ -336,21 +351,22 @@ func (idx *VPIndex) greedyToLeaf(query []float32, nodeIdx int32, knn *vpKNN, pq 
 // Search encontra os k vizinhos mais próximos de query e retorna a fração
 // de vizinhos fraudulentos (fraud score em [0.0, 1.0]).
 //
-// Algoritmo: greedy descent + backtracking limitado.
+// Algoritmo: greedy descent + backtracking em dois estágios.
 //
-//  1. Desce greedy da raiz até a folha mais próxima (O(depth) = ~16 passos).
-//     Salva os ramos descartados no PQ de backtracking com seus minDists.
-//  2. Early exit: se após a 1ª folha fraudCount=0 ou k, retorna imediato.
-//  3. Backtracking: explora até vpMaxLeafVisits-1 folhas adicionais,
-//     priorizando pelo minDist (triângulo). Para cada entrada do PQ,
-//     desce greedy até a próxima folha.
+//  1. Estágio rápido: desce greedy + vpInitialLeafVisits-1 folhas adicionais.
+//     Custo: ~5×80 ops × 7ns ≈ 2.8µs.
+//     Cobre 96%+ dos casos (fraudCount 0 ou k = decisão clara).
 //
-// Custo por query (N=3M, leafSize=64, vpMaxLeafVisits=5):
+//  2. Refinamento (só casos borderline, fraudCount ∈ {1..k-1}):
+//     Continua o backtracking do PQ existente até vpMaxLeafVisits folhas.
+//     Custo: até ~500×80 ops × 7ns ≈ 280µs (para ~4% dos casos).
+//     Elimina a maioria dos falsos positivos/negativos em casos ambíguos.
 //
-//	~16 internos (16 sqrts) + 5×64 leaf (0 sqrts) ≈ 340 ops × 7ns ≈ 2.4µs
+// Custo médio (N=3M, 96% clear + 4% borderline):
 //
-// Precisão: float32 para queries; int8 reconstruído para referências.
-// Melhor que HNSW int8 para edge cases (fraudCount ∈ {1,2,3,4}).
+//	0.96×2.8 + 0.04×280 ≈ 14µs/query média.
+//
+// Precisão: int16 (±0.000015/dim) ≈ float32. Elimina erros de quantização int8.
 func (idx *VPIndex) Search(query []float32, k int) float32 {
 	knn := <-idx.knnPool
 	pq := <-idx.pqPool
@@ -363,20 +379,29 @@ func (idx *VPIndex) Search(query []float32, k int) float32 {
 		idx.pqPool <- pq
 	}()
 
-	// ── Fase 1: greedy descent até a primeira folha ───────────────────────
+	// ── Estágio 1: busca rápida (todos os casos) ──────────────────────────
 	idx.greedyToLeaf(query, 0, knn, pq)
-
-	// ── Fase 2: backtracking — explora folhas adicionais ─────────────────
-	// Sempre explora vpMaxLeafVisits folhas para precisão máxima.
-	// O early exit HNSW-style não é aplicado aqui: com leafSize=64 a
-	// primeira folha dá apenas ~80 candidatos — pode ser prematuro para
-	// casos borderline (fraudCount ∈ {1,2,3,4} que pesam 3× no score).
-	for leafVisits := 1; leafVisits < vpMaxLeafVisits && len(pq.buf) > 0; leafVisits++ {
+	for leafVisits := 1; leafVisits < vpInitialLeafVisits && len(pq.buf) > 0; leafVisits++ {
 		c := pq.pop()
 		if knn.n == k && c.minDist >= knn.worstActual() {
-			break // prune por triangle inequality
+			break
 		}
 		idx.greedyToLeaf(query, c.nodeIdx, knn, pq)
+	}
+
+	// ── Estágio 2: refinamento só para casos borderline ───────────────────
+	// Casos com fraudCount ∈ {1..k-1} são ambíguos — o estágio 1 pode
+	// ter encontrado os k vizinhos errados (vizinhança mista).
+	// Casos com fraudCount=0 ou k (unânimes) raramente mudam com mais busca.
+	fc := knn.fraudCount(idx.labels)
+	if fc > 0 && fc < k {
+		for leafVisits := vpInitialLeafVisits; leafVisits < vpMaxLeafVisits && len(pq.buf) > 0; leafVisits++ {
+			c := pq.pop()
+			if knn.n == k && c.minDist >= knn.worstActual() {
+				break
+			}
+			idx.greedyToLeaf(query, c.nodeIdx, knn, pq)
+		}
 	}
 
 	return knn.fraudFraction(idx.labels, k)

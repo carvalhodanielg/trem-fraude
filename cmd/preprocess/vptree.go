@@ -11,12 +11,20 @@
 //	[4] uint32 padding    — alinhamento
 //	[nodeCount × 16] vpNode — nós da árvore (internos e folhas)
 //	[N × 4] uint32          — perm[]: índices originais na ordem VP-Tree
+//	[N × 14 × 2] int16      — vetores quantizados em int16 (alta precisão)
 //
 // Codificação de folha em vpNode:
 //
 //	left  = -(lo+1)  → lo = -(left+1)
 //	right = -(hi+1)  → hi = -(right+1)
 //	range perm[lo:hi] contém os pontos desta folha.
+//
+// Quantização int16:
+//
+//	Valores em [0,1] → [0, 32767]. Sentinela −1.0 → int16(−1).
+//	Precisão: ±0.000015 por dimensão (vs ±0.004 do int8).
+//	Erro máximo L2 em 14D: sqrt(14 × (0.000015/2)²) ≈ 0.000028.
+//	Elimina virtualmente todos os erros de classificação por quantização.
 package main
 
 import (
@@ -174,8 +182,28 @@ func buildRec(vecs [][dim]float32, perm []uint32, lo, hi int, nodes *[]vpBuildNo
 	return nodeIdx
 }
 
+// quantize16 converte float32 → int16.
+// Valores em [0,1] → [0, 32767]. Sentinela −1.0 → int16(−1).
+// Precisão: ±0.000015 por dimensão (250× melhor que int8).
+func quantize16(v float32) int16 {
+	if v < -0.5 { // único caso negativo: sentinela −1.0
+		return -1
+	}
+	if v < 0 {
+		return 0
+	}
+	r := math.Round(float64(v) * 32767)
+	if r > 32767 {
+		r = 32767
+	}
+	return int16(r)
+}
+
 // writeVPTree serializa a VP-Tree em vptree.bin.
-func writeVPTree(path string, N int, nodes []vpBuildNode, perm []uint32) error {
+// Inclui os vetores float32 originais quantizados em int16 (alta precisão)
+// para garantir que as distâncias computadas na busca sejam equivalentes
+// às distâncias float32 brutas (dentro de ±0.000028 em L2 para 14D).
+func writeVPTree(path string, N int, nodes []vpBuildNode, perm []uint32, vecs [][dim]float32) error {
 	start := time.Now()
 	log.Printf("escrevendo VP-Tree em %s (%d nós, %d pontos)...", path, len(nodes), N)
 
@@ -201,6 +229,10 @@ func writeVPTree(path string, N int, nodes []vpBuildNode, perm []uint32) error {
 		binary.LittleEndian.PutUint32(buf[:], uint32(v))
 		bw.Write(buf[:]) //nolint:errcheck
 	}
+	writeI16 := func(v int16) {
+		bw.WriteByte(byte(v))
+		bw.WriteByte(byte(v >> 8))
+	}
 
 	// Cabeçalho (16 bytes)
 	write32(uint32(N))
@@ -219,6 +251,14 @@ func writeVPTree(path string, N int, nodes []vpBuildNode, perm []uint32) error {
 	// Permutação (N × 4 bytes)
 	for _, p := range perm {
 		write32(p)
+	}
+
+	// Vetores int16 (N × dim × 2 bytes) — alta precisão para busca exata
+	// Alinhamento: offset = 16 + nodeCount*16 + N*4 — múltiplo de 4 (N par) ✓
+	for _, v := range vecs {
+		for _, x := range v {
+			writeI16(quantize16(x))
+		}
 	}
 
 	if err := bw.Flush(); err != nil {

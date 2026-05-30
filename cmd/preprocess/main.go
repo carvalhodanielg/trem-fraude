@@ -363,12 +363,12 @@ func main() {
 	}
 
 	vpNodes, vpPerm := buildVPTree(rawVectors)
-	rawVectors = nil // libera memória após o build
 	log.Printf("VP-Tree construída: %d nós, %d pontos", len(vpNodes), N)
 
-	if err := writeVPTree(vpOutput, N, vpNodes, vpPerm); err != nil {
+	if err := writeVPTree(vpOutput, N, vpNodes, vpPerm, rawVectors); err != nil {
 		log.Fatal("writeVPTree:", err)
 	}
+	rawVectors = nil // libera memória após escrita
 
 	log.Printf("concluído — tempo total: %s", time.Since(start))
 }
