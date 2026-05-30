@@ -19,7 +19,7 @@ import (
 )
 
 var (
-	idxPtr  atomic.Pointer[index.Index]
+	idxPtr  atomic.Pointer[index.VPIndex]
 	normPtr atomic.Pointer[vector.NormalizationConstants]
 	riskPtr atomic.Pointer[map[string]float32]
 )
@@ -85,9 +85,9 @@ func startup() {
 	}
 	riskPtr.Store(&mccRisk)
 
-	idx, err := index.Load("resources/index.bin")
+	idx, err := index.LoadVP("resources/index.bin", "resources/vptree.bin")
 	if err != nil {
-		log.Fatalf("erro ao carregar índice: %v", err)
+		log.Fatalf("erro ao carregar índice VP-Tree: %v", err)
 	}
 
 	// idx é o último a ser armazenado — é ele que sinaliza que está pronto

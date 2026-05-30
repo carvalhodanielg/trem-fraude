@@ -281,7 +281,7 @@ func main() {
 			bw.WriteByte(byte(quantize(vec[d])))
 		}
 	}
-	rawVectors = nil
+	// rawVectors mantido vivo — será usado na fase 4 (VP-Tree)
 	log.Println("  vetores escritos")
 
 	// Labels (N × uint8)
@@ -353,6 +353,22 @@ func main() {
 	}
 
 	stat, _ := os.Stat(output)
-	log.Printf("índice salvo: %s (%.1f MB) — tempo total: %s",
-		output, float64(stat.Size())/1024/1024, time.Since(start))
+	log.Printf("índice HNSW salvo: %s (%.1f MB)", output, float64(stat.Size())/1024/1024)
+
+	// ── Fase 4: Construir VP-Tree e escrever vptree.bin ───────────────────
+	log.Println("fase 4: construindo VP-Tree...")
+	vpOutput := "resources/vptree.bin"
+	if len(os.Args) > 3 {
+		vpOutput = os.Args[3]
+	}
+
+	vpNodes, vpPerm := buildVPTree(rawVectors)
+	rawVectors = nil // libera memória após o build
+	log.Printf("VP-Tree construída: %d nós, %d pontos", len(vpNodes), N)
+
+	if err := writeVPTree(vpOutput, N, vpNodes, vpPerm); err != nil {
+		log.Fatal("writeVPTree:", err)
+	}
+
+	log.Printf("concluído — tempo total: %s", time.Since(start))
 }
