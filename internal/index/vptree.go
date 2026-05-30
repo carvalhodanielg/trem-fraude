@@ -39,14 +39,12 @@ import (
 )
 
 // vpInitialLeafVisits: folhas visitadas na busca rápida (todos os casos).
-// Com dual-tree: initPerTree = ceil(6/2) = 3 por árvore = 6 total.
-// ~6×(16+64) ≈ 480 ops × 7ns ≈ 3.4µs/query.
-const vpInitialLeafVisits = 6
+// ~5×(16+64) ≈ 400 ops × 7ns ≈ 2.8µs/query.
+const vpInitialLeafVisits = 5
 
 // vpMaxLeafVisits: folhas visitadas TOTAL na busca refinada (só casos borderline).
-// Com dual-tree interleaved: budget 700 compartilhado entre tree 1 e tree 2.
 // ~700×(16+64) ≈ 56000 ops × 7ns ≈ 392µs/query (apenas ~4% dos casos).
-// Média ponderada: 0.96×3.4 + 0.04×392 ≈ 18.9µs/query.
+// Média ponderada: 0.96×2.8 + 0.04×392 ≈ 18.4µs/query.
 const vpMaxLeafVisits = 700
 
 // vpPQInitialCap: capacidade inicial do PQ de backtracking.
@@ -91,10 +89,9 @@ type vpPQ struct {
 	buf []vpPQEntry
 }
 
-// VPIndex é o índice VP-Tree dual carregado via mmap.
-// Duas árvores com seeds diferentes (seed 1 e seed 2) exploram regiões distintas
-// do espaço: a busca interleaved entre elas cobre mais da vizinhança verdadeira
-// de casos borderline dentro do mesmo orçamento de folhas.
+// VPIndex é o índice VP-Tree carregado via mmap.
+// Duas árvores (seeds 1 e 2) estão presentes no vptree.bin; a busca usa tree 1.
+// Tree 2 é carregada mas não usada na busca (reservada para experimentos futuros).
 type VPIndex struct {
 	n         int
 	vectors16 []int16 // mmap'd de vptree.bin: N×dim int16 (±0.000015/dim)
@@ -264,7 +261,16 @@ func (h *vpKNN) worstActual() float32 {
 }
 
 // tryInsertSq tenta inserir (dSq, pt) no heap de distâncias ao quadrado.
+// Deduplicação: ignora o ponto se já está no heap (necessário para dual-tree,
+// onde o mesmo ponto pode aparecer como VP em tree 1 e leaf em tree 2).
+// Custo de dedup: O(k) = O(5) comparações por inserção — negligível.
 func (h *vpKNN) tryInsertSq(dSq float32, pt uint32) {
+	// Dedup: ponto já presente → ignora (evita duplicatas no fraud count)
+	for i := 0; i < h.n; i++ {
+		if h.idx[i] == pt {
+			return
+		}
+	}
 	if h.n < 5 {
 		h.dSq[h.n] = dSq
 		h.idx[h.n] = pt
@@ -384,89 +390,60 @@ func (idx *VPIndex) greedyToLeaf(nodes []vpNode, perm []uint32, query []float32,
 // Search encontra os k vizinhos mais próximos de query e retorna a fração
 // de vizinhos fraudulentos (fraud score em [0.0, 1.0]).
 //
-// Algoritmo: greedy descent dual-tree + backtracking em dois estágios.
+// Algoritmo: greedy descent single-tree + backtracking em dois estágios.
 //
-//  1. Estágio rápido (todos os casos): 3 descents de tree 1 + 3 de tree 2 = 6 total.
-//     Custo: ~6×80 ops × 7ns ≈ 3.4µs.
+//  1. Estágio rápido (todos os casos): vpInitialLeafVisits descents (tree 1).
+//     Custo: ~5×80 ops × 7ns ≈ 2.8µs.
 //     Cobre 96%+ dos casos (fraudCount 0 ou k = decisão clara).
 //
 //  2. Refinamento (só casos borderline, fraudCount ∈ {1..k-1}):
-//     Busca interleaved entre tree 1 e tree 2, até vpMaxLeafVisits folhas total.
-//     Em cada passo, escolhe o PQ com menor minDist (exploração ótima).
+//     Continua explorando via PQ de backtracking da tree 1 até vpMaxLeafVisits.
 //     Custo: até ~700×80 ops × 7ns ≈ 392µs (para ~4% dos casos).
-//     Two trees cover regiões que uma única árvore omitiria → ~30-50% menos failures.
 //
 // Custo médio (N=3M, 96% clear + 4% borderline):
 //
-//	0.96×3.4 + 0.04×392 ≈ 18.9µs/query média.
+//	0.96×2.8 + 0.04×392 ≈ 18.4µs/query média.
 //
-// Precisão: int16 (±0.000015/dim) ≈ float32. Compartilhado entre as duas árvores.
+// Nota: pq2 é adquirido do pool para manter compatibilidade com o formato
+// dual-tree do vptree.bin, mas não é usado na busca (tree 1 é suficiente).
 func (idx *VPIndex) Search(query []float32, k int) float32 {
 	knn := <-idx.knnPool
-	pq1 := <-idx.pqPool
-	pq2 := <-idx.pq2Pool
+	pq := <-idx.pqPool
+	pq2 := <-idx.pq2Pool // adquirido mas não usado na busca
 	defer func() {
 		knn.reset()
 		idx.knnPool <- knn
 	}()
 	defer func() {
-		pq1.buf = pq1.buf[:0]
-		idx.pqPool <- pq1
+		pq.buf = pq.buf[:0]
+		idx.pqPool <- pq
 	}()
 	defer func() {
 		pq2.buf = pq2.buf[:0]
 		idx.pq2Pool <- pq2
 	}()
 
-	// ── Estágio 1: busca rápida (3 descents por árvore) ──────────────────
-	const initPerTree = (vpInitialLeafVisits + 1) / 2 // 3 para vpInitialLeafVisits=6
-	idx.greedyToLeaf(idx.nodes, idx.perm, query, 0, knn, pq1)
-	for i := 1; i < initPerTree && len(pq1.buf) > 0; i++ {
-		c := pq1.pop()
+	// ── Estágio 1: vpInitialLeafVisits descents greedy (tree 1) ──────────
+	idx.greedyToLeaf(idx.nodes, idx.perm, query, 0, knn, pq)
+	for leafVisits := 1; leafVisits < vpInitialLeafVisits && len(pq.buf) > 0; leafVisits++ {
+		c := pq.pop()
 		if knn.n == k && c.minDist >= knn.worstActual() {
 			break
 		}
-		idx.greedyToLeaf(idx.nodes, idx.perm, query, c.nodeIdx, knn, pq1)
-	}
-	idx.greedyToLeaf(idx.nodes2, idx.perm2, query, 0, knn, pq2)
-	for i := 1; i < initPerTree && len(pq2.buf) > 0; i++ {
-		c := pq2.pop()
-		if knn.n == k && c.minDist >= knn.worstActual() {
-			break
-		}
-		idx.greedyToLeaf(idx.nodes2, idx.perm2, query, c.nodeIdx, knn, pq2)
+		idx.greedyToLeaf(idx.nodes, idx.perm, query, c.nodeIdx, knn, pq)
 	}
 
-	// ── Estágio 2: refinamento interleaved só para casos borderline ───────
-	// Casos borderline (fraudCount ∈ {1..k-1}) recebem busca extra interleaved:
-	// em cada passo escolhemos o PQ com menor minDist (tree 1 ou tree 2).
-	// As duas árvores têm estruturas diferentes → cobrem regiões complementares.
+	// ── Estágio 2: refinamento só para casos borderline (tree 1) ─────────
+	// Casos borderline (fraudCount ∈ {1..k-1}) recebem busca extra via PQ.
+	// Stage 1 já preencheu o PQ com nós a explorar — continuamos de onde paramos.
 	fc := knn.fraudCount(idx.labels)
 	if fc > 0 && fc < k {
-		for leafVisits := vpInitialLeafVisits; leafVisits < vpMaxLeafVisits; leafVisits++ {
-			h1 := len(pq1.buf) > 0
-			h2 := len(pq2.buf) > 0
-			if !h1 && !h2 {
+		for leafVisits := vpInitialLeafVisits; leafVisits < vpMaxLeafVisits && len(pq.buf) > 0; leafVisits++ {
+			c := pq.pop()
+			if knn.n == k && c.minDist >= knn.worstActual() {
 				break
 			}
-
-			// Escolhe a árvore com menor minDist no topo do PQ
-			useTree1 := h1 && (!h2 || pq1.buf[0].minDist <= pq2.buf[0].minDist)
-			if useTree1 {
-				c := pq1.pop()
-				if knn.n == k && c.minDist >= knn.worstActual() {
-					pq1.buf = pq1.buf[:0] // tree 1 esgotada — descarta entradas restantes
-					continue
-				}
-				idx.greedyToLeaf(idx.nodes, idx.perm, query, c.nodeIdx, knn, pq1)
-			} else {
-				c := pq2.pop()
-				if knn.n == k && c.minDist >= knn.worstActual() {
-					pq2.buf = pq2.buf[:0] // tree 2 esgotada
-					continue
-				}
-				idx.greedyToLeaf(idx.nodes2, idx.perm2, query, c.nodeIdx, knn, pq2)
-			}
+			idx.greedyToLeaf(idx.nodes, idx.perm, query, c.nodeIdx, knn, pq)
 		}
 	}
 
