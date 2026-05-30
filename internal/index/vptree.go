@@ -44,7 +44,7 @@ const vpInitialLeafVisits = 5
 
 // vpMaxLeafVisits: folhas visitadas TOTAL na busca refinada (só casos borderline).
 // ~700×(16+64) ≈ 56000 ops × 7ns ≈ 392µs/query (apenas ~4% dos casos).
-// Média ponderada: 0.96×2.8 + 0.04×392 ≈ 18.4µs/query.
+// Média ponderada: 0.96×2.8µs + 0.04×392µs ≈ 18.4µs/query.
 const vpMaxLeafVisits = 700
 
 // vpPQInitialCap: capacidade inicial do PQ de backtracking.
@@ -448,4 +448,47 @@ func (idx *VPIndex) Search(query []float32, k int) float32 {
 	}
 
 	return knn.fraudFraction(idx.labels, k)
+}
+
+// WarmUp pré-carrega páginas de vptree.bin no page cache do OS via buscas reais.
+//
+// O problema: vptree.bin (~107MB) é mmap'd mas as páginas só entram no cache
+// quando acessadas. Com cold start, as primeiras N requisições sofrem page faults
+// (disk I/O latência ≈ 0.1–1 ms cada) que aumentam o p99 no início do teste.
+//
+// Solução: fazer nWarming buscas greedy usando vetores reais do índice como query,
+// dispersados uniformemente pelo array. Cada busca acessa ~80 pontos e atravessa
+// depth=16 nós internos, cobrindo ≈ 2.5 kB de páginas distintas.
+// Com 3000 buscas: ~7.5 MB de páginas de nodes+vectors acessadas aleatoriamente —
+// suficiente para precarregar os nós raiz (L0–L11) e o path mais quente da árvore.
+//
+// Nota: não faz leitura sequencial de vectors16 (84 MB) para evitar exceder
+// o limite de 170 MB de memória do container.
+func (idx *VPIndex) WarmUp() {
+	const nWarming = 3000
+	knn := &vpKNN{}
+	pq := &vpPQ{buf: make([]vpPQEntry, 0, 64)}
+
+	step := idx.n / nWarming
+	if step < 1 {
+		step = 1
+	}
+
+	for i := 0; i < nWarming && i*step < idx.n; i++ {
+		ptIdx := i * step
+		// Constrói query float32 a partir do vetor int16 do ponto ptIdx
+		var query [dim]float32
+		ref := idx.vectors16[ptIdx*dim : ptIdx*dim+dim]
+		const scale = float32(1.0 / 32767.0)
+		for j := 0; j < dim; j++ {
+			if ref[j] < 0 {
+				query[j] = -1.0
+			} else {
+				query[j] = float32(ref[j]) * scale
+			}
+		}
+		knn.reset()
+		pq.buf = pq.buf[:0]
+		idx.greedyToLeaf(idx.nodes, idx.perm, query[:], 0, knn, pq)
+	}
 }
