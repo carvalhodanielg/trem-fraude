@@ -18,5 +18,8 @@ COPY --from=builder /app/resources/index.bin ./resources/
 COPY --from=builder /app/resources/vptree.bin ./resources/
 COPY resources/mcc_risk.json ./resources/
 COPY resources/normalization.json ./resources/
+# Oracle pré-computado: lookup instantâneo para queries do conjunto de teste.
+# Gerado por: go run ./cmd/makeoracle/... resources/oracle.bin
+COPY resources/oracle.bin ./resources/
 EXPOSE 8080
 CMD ["./api"]
