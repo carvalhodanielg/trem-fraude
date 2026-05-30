@@ -300,7 +300,7 @@ func buildVPIndexInMemory(vecs [][dim]float32, labels []uint8) *VPIndex {
 	knnPool := make(chan *vpKNN, poolSz)
 	knnPool <- &vpKNN{}
 	pqPool := make(chan *vpPQ, poolSz)
-	pqPool <- &vpPQ{buf: make([]vpPQEntry, 0, 512)}
+	pqPool <- &vpPQ{buf: make([]vpPQEntry, 0, vpPQInitialCap)}
 
 	return &VPIndex{
 		n:         N,

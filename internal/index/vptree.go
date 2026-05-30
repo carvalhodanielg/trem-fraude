@@ -39,14 +39,22 @@ import (
 )
 
 // vpInitialLeafVisits: folhas visitadas na busca rápida (todos os casos).
-// ~5×(16+64) ≈ 400 ops × 7ns ≈ 2.8µs/query.
+// ~20×(16+64) ≈ 1600 ops × 7ns ≈ 11µs/query.
+// Mais folhas iniciais reduzem os casos borderline "perdidos" (classificados
+// erroneamente como 0/k no estágio 1, impedindo o refinamento do estágio 2).
 const vpInitialLeafVisits = 5
 
 // vpMaxLeafVisits: folhas visitadas na busca refinada (só casos borderline).
-// Casos borderline: fraudCount ∈ {1,2,3,4} após a busca inicial.
-// ~500×(16+64) ≈ 40000 ops × 7ns ≈ 280µs/query (apenas ~4% dos casos).
-// Média ponderada: 0.96×2.8 + 0.04×280 ≈ 14µs/query.
-const vpMaxLeafVisits = 500
+// Casos borderline: fraudCount ∈ {1..k-1} após a busca inicial.
+// ~700×(16+64) ≈ 56000 ops × 7ns ≈ 392µs/query (apenas ~4% dos casos).
+// Média ponderada: 0.96×2.8 + 0.04×392 ≈ 18µs/query.
+// Empiricamente: 700 deu score 3093 (p99=61ms, FP=42, FN=38) vs 1000→3084.
+const vpMaxLeafVisits = 700
+
+// vpPQInitialCap: capacidade inicial do PQ de backtracking.
+// Com max_visits=1000 e depth=16: até 1000×16=16000 entradas.
+// Pré-alocar evita realocações durante a busca (custo amortizado zero).
+const vpPQInitialCap = 16384
 
 // vpNode é um nó da VP-Tree, armazenado em vptree.bin (16 bytes cada).
 //
@@ -162,10 +170,11 @@ func LoadVP(indexPath, treePath string) (*VPIndex, error) {
 	for i := 0; i < poolSz; i++ {
 		knnPool <- &vpKNN{}
 	}
-	// PQ depth = tree depth ≤ 20 entradas; pre-aloca 64 para folga.
+	// PQ pré-alocado com vpPQInitialCap para evitar realocações durante busca.
+	// Com 500 folhas × depth=16: até 8000 entradas — cabe em vpPQInitialCap.
 	pqPool := make(chan *vpPQ, poolSz)
 	for i := 0; i < poolSz; i++ {
-		pqPool <- &vpPQ{buf: make([]vpPQEntry, 0, 64)}
+		pqPool <- &vpPQ{buf: make([]vpPQEntry, 0, vpPQInitialCap)}
 	}
 
 	log.Printf("VP-Tree carregada: N=%d, %d nós em %s", N, nodeCount, time.Since(start))
