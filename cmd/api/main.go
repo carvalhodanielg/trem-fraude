@@ -22,9 +22,6 @@ var (
 	idxPtr    atomic.Pointer[index.VPIndex]
 	normPtr   atomic.Pointer[vector.NormalizationConstants]
 	riskPtr   atomic.Pointer[map[string]float32]
-	oraclePtr atomic.Pointer[index.Oracle]
-	// readyFlag: true quando norm+risk+oracle estão carregados (oracle-ready).
-	// Quando idxPtr!=nil, VP-Tree também está disponível como fallback.
 	readyFlag atomic.Bool
 )
 
@@ -89,52 +86,26 @@ func startup() {
 	}
 	riskPtr.Store(&mccRisk)
 
-	// Oracle: lookup instantâneo para queries do conjunto de teste conhecido.
-	// Se oracle.bin não existir, VP-Tree é usada normalmente como fallback.
-	oracleAvailable := false
-	if oracle, err := index.LoadOracle("resources/oracle.bin"); err != nil {
-		log.Printf("oracle não disponível (usando apenas VP-Tree): %v", err)
-	} else {
-		oraclePtr.Store(oracle)
-		oracleAvailable = true
-		log.Printf("oracle carregado: %d entradas", 54100)
-	}
-
-	if oracleAvailable {
-		// Com oracle, o servidor pode responder imediatamente a todas as queries
-		// do conjunto de teste sem precisar da VP-Tree. Marca ready agora.
-		readyFlag.Store(true)
-		log.Println("oracle pronto — servidor disponível para healthcheck")
-	}
-
-	// Carrega VP-Tree (fallback para queries fora do oracle).
-	// Com oracle, isso roda em background enquanto o test já começa.
 	idx, err := index.LoadVP("resources/index.bin", "resources/vptree.bin")
 	if err != nil {
 		log.Fatalf("erro ao carregar índice VP-Tree: %v", err)
 	}
 
-	if !oracleAvailable {
-		// Sem oracle: estratégia original de warm-up tardio.
-		// Aguarda 57s para manter pages quentes na janela do teste.
-		log.Println("aguardando warm-up tardio (57s)...")
-		time.Sleep(57 * time.Second)
-		t0 := time.Now()
-		idx.WarmUp()
-		log.Printf("warm-up concluído em %s", time.Since(t0))
-		readyFlag.Store(true)
-	}
-	// Com oracle: NÃO faz warm-up da VP-Tree — ela é apenas fallback.
-	// Não tocar as pages do mmap evita RSS alto sem necessidade.
+	// Warm-up tardio: aguarda 57s para manter pages quentes na janela do teste.
+	log.Println("aguardando warm-up tardio (57s)...")
+	time.Sleep(57 * time.Second)
+	t0 := time.Now()
+	idx.WarmUp()
+	log.Printf("warm-up concluído em %s", time.Since(t0))
 
-	// idx é armazenado para habilitar o fallback VP-Tree caso oracle falhe.
 	idxPtr.Store(idx)
+	readyFlag.Store(true)
 
 	// Devolve ao OS qualquer heap Go liberado durante o loading.
 	runtime.GC()
 	debug.FreeOSMemory()
 
-	log.Println("pronto — VP-Tree + Oracle ativos")
+	log.Println("pronto — VP-Tree ativa")
 }
 
 func handleReady(w http.ResponseWriter, r *http.Request) {
@@ -186,37 +157,6 @@ func handleFraudScore(w http.ResponseWriter, r *http.Request) {
 	bodyBuf.ReadFrom(r.Body) //nolint:errcheck
 	body := bodyBuf.Bytes()
 
-	// Oracle fast-path: extrai o ID sem JSON parse completo.
-	// O body tem formato: {"id":"tx-{N}","transaction":{...},...}
-	// Scan por `"id":"tx-` nos primeiros bytes → extrai N → lookup.
-	// Economiza ~100µs de JSON parse por request no path crítico.
-	if oracle := oraclePtr.Load(); oracle != nil {
-		const prefix = `"id":"tx-`
-		if idx := bytes.Index(body[:min(len(body), 64)], []byte(prefix)); idx >= 0 {
-			start := idx + len(prefix)
-			end := start
-			for end < len(body) && body[end] >= '0' && body[end] <= '9' {
-				end++
-			}
-			if end > start {
-				if idNum, err := strconv.ParseUint(string(body[start:end]), 10, 64); err == nil {
-					if approved, found := oracle.Lookup(idNum); found {
-						reqBufPool.Put(bodyBuf)
-						w.Header().Set("Content-Type", "application/json")
-						if approved {
-							w.Write(approvedJSON) //nolint:errcheck
-						} else {
-							w.Write(rejectedJSON) //nolint:errcheck
-						}
-						return
-					}
-				}
-			}
-		}
-	}
-
-	// Fallback: parse completo + VP-Tree search para queries não no oracle.
-	// go-json é 5-10× mais rápido que encoding/json.
 	var req fraudRequest
 	if err := gojson.Unmarshal(body, &req); err != nil {
 		reqBufPool.Put(bodyBuf)
@@ -226,7 +166,6 @@ func handleFraudScore(w http.ResponseWriter, r *http.Request) {
 	}
 	reqBufPool.Put(bodyBuf)
 
-	// Fallback: VP-Tree search para queries não encontradas no oracle.
 	idx := idxPtr.Load()
 	norm := normPtr.Load()
 	risk := riskPtr.Load()
