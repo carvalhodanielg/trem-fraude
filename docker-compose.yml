@@ -13,7 +13,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.8"
+          cpus: "0.1"
           memory: "10MB"
 
   api_1:
@@ -27,11 +27,11 @@ services:
       interval: 2s
       timeout: 3s
       retries: 10
-      start_period: 5s
+      start_period: 65s
     deploy:
       resources:
         limits:
-          cpus: "0.1"
+          cpus: "0.45"
           memory: "170MB"
 
   api_2:
@@ -45,11 +45,11 @@ services:
       interval: 2s
       timeout: 3s
       retries: 10
-      start_period: 5s
+      start_period: 65s
     deploy:
       resources:
         limits:
-          cpus: "0.1"
+          cpus: "0.45"
           memory: "170MB"
 
 networks:
