@@ -3,4 +3,5 @@
 /api_static
 /preprocess
 resources/index.bin
+resources/vptree.bin
 .spec/

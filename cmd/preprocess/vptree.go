@@ -48,10 +48,19 @@ type vpBuildNode struct {
 }
 
 // distEuclid calcula a distância euclidiana real entre dois vetores float32.
+// Sentinelas (valor < 0): se apenas um dos dois for sentinela, custo fixo 1.0
+// (igual ao runtime distSqF32). Ambos sentinelas: custo 0 (ambos ausentes).
 func distEuclid(a, b [dim]float32) float32 {
 	var sum float32
 	for i := 0; i < dim; i++ {
-		d := a[i] - b[i]
+		ai, bi := a[i], b[i]
+		if ai < 0 || bi < 0 {
+			if !(ai < 0 && bi < 0) {
+				sum += 1.0
+			}
+			continue
+		}
+		d := ai - bi
 		sum += d * d
 	}
 	return float32(math.Sqrt(float64(sum)))
