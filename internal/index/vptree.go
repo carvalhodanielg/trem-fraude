@@ -41,12 +41,14 @@ import (
 )
 
 // vpInitialLeafVisits: folhas visitadas na busca rápida (todos os casos).
-// ~10×(16+64) ≈ 800 ops × 7ns ≈ 5.6µs/query.
-const vpInitialLeafVisits = 10
+// ~15×(16+64) ≈ 1200 ops × 7ns ≈ 8.4µs/query. Aumentado de 10→15: melhora o
+// recall dos casos claros (fc=0 ou fc=k) que pulam o refinamento do estágio 2.
+const vpInitialLeafVisits = 15
 
 // vpMaxLeafVisits: folhas visitadas TOTAL na busca refinada (casos borderline: fc∈[1,k-1]).
-// ~100×(16+64) ≈ 8000 ops × 7ns ≈ 56µs/query (safety cap após gating inteligente).
-const vpMaxLeafVisits = 100
+// ~300×(16+64) ≈ 24000 ops × 7ns ≈ 168µs/query (safety cap após gating inteligente).
+// Aumentado de 100→300: knee de recall — E satura em 200 a partir daqui (300/700 iguais).
+const vpMaxLeafVisits = 300
 
 // vpPQInitialCap: capacidade inicial do PQ de backtracking.
 // Com max_visits=1000 e depth=16: até 1000×16=16000 entradas.
