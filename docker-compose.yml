@@ -21,7 +21,7 @@ services:
     environment:
       - GOMAXPROCS=1
       - GOMEMLIMIT=145MiB
-      - GOGC=off
+      - GOGC=100  # NÃO usar off: heap inflava ~113MB e despejava o índice mmap → reclaim direto → p99 estourava. Diag cgroup: p99 4895ms→2ms com GC ligado.
     healthcheck:
       test: [ "CMD", "wget", "-qO-", "http://localhost:8080/ready" ]
       interval: 2s
@@ -39,7 +39,7 @@ services:
     environment:
       - GOMAXPROCS=1
       - GOMEMLIMIT=145MiB
-      - GOGC=off
+      - GOGC=100  # NÃO usar off: heap inflava ~113MB e despejava o índice mmap → reclaim direto → p99 estourava. Diag cgroup: p99 4895ms→2ms com GC ligado.
     healthcheck:
       test: [ "CMD", "wget", "-qO-", "http://localhost:8080/ready" ]
       interval: 2s
