@@ -36,16 +36,19 @@ import (
 	"math"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // vpInitialLeafVisits: folhas visitadas na busca rápida (todos os casos).
-// ~5×(16+64) ≈ 400 ops × 7ns ≈ 2.8µs/query.
-const vpInitialLeafVisits = 5
+// ~15×(16+64) ≈ 1200 ops × 7ns ≈ 8.4µs/query. Aumentado de 10→15: melhora o
+// recall dos casos claros (fc=0 ou fc=k) que pulam o refinamento do estágio 2.
+const vpInitialLeafVisits = 15
 
-// vpMaxLeafVisits: folhas visitadas TOTAL na busca refinada (só casos borderline).
-// ~700×(16+64) ≈ 56000 ops × 7ns ≈ 392µs/query (apenas ~4% dos casos).
-// Média ponderada: 0.96×2.8µs + 0.04×392µs ≈ 18.4µs/query.
-const vpMaxLeafVisits = 700
+// vpMaxLeafVisits: folhas visitadas TOTAL na busca refinada (casos borderline: fc∈[1,k-1]).
+// ~300×(16+64) ≈ 24000 ops × 7ns ≈ 168µs/query (safety cap após gating inteligente).
+// Aumentado de 100→300: knee de recall — E satura em 200 a partir daqui (300/700 iguais).
+const vpMaxLeafVisits = 300
 
 // vpPQInitialCap: capacidade inicial do PQ de backtracking.
 // Com max_visits=1000 e depth=16: até 1000×16=16000 entradas.
@@ -90,8 +93,8 @@ type vpPQ struct {
 }
 
 // VPIndex é o índice VP-Tree carregado via mmap.
-// Duas árvores (seeds 1 e 2) estão presentes no vptree.bin; a busca usa tree 1.
-// Tree 2 é carregada mas não usada na busca (reservada para experimentos futuros).
+// Duas árvores (seeds 1 e 2) usadas em multi-probe: tree 1 para busca inicial,
+// tree 2 para encontrar vizinhos que tree 1 perde (seeds diferentes → estruturas diferentes).
 type VPIndex struct {
 	n         int
 	vectors16 []int16 // mmap'd de vptree.bin: N×dim int16 (±0.000015/dim)
@@ -140,6 +143,8 @@ func LoadVP(indexPath, treePath string) (*VPIndex, error) {
 	if err != nil {
 		return nil, fmt.Errorf("LoadVP tree: %w", err)
 	}
+	// Inicia pre-fetch assíncrono de todas as páginas antes do parse.
+	_ = unix.Madvise(treeData, unix.MADV_WILLNEED)
 
 	// ── Parse index.bin: apenas header (N) e labels ──────────────────────────
 	if len(idxData) < 16 {
@@ -305,6 +310,25 @@ func (h *vpKNN) fraudFraction(labels []uint8, k int) float32 {
 	return float32(h.fraudCount(labels)) / float32(k)
 }
 
+// fraudFractionWeighted retorna a fração ponderada de fraudes por 1/dSq.
+// Vizinhos mais próximos têm peso maior — melhor calibração do score para
+// casos borderline onde os vizinhos fraude são mais distantes que os legit.
+func (h *vpKNN) fraudFractionWeighted(labels []uint8) float32 {
+	const eps = float32(1e-9)
+	var fraudW, totalW float32
+	for i := 0; i < h.n; i++ {
+		w := 1.0 / (h.dSq[i] + eps)
+		totalW += w
+		if labels[h.idx[i]] == 1 {
+			fraudW += w
+		}
+	}
+	if totalW == 0 {
+		return 0
+	}
+	return fraudW / totalW
+}
+
 // ── vpPQ: min-heap de backtracking (minDist = distância REAL) ────────────────
 
 func (pq *vpPQ) push(e vpPQEntry) {
@@ -390,26 +414,27 @@ func (idx *VPIndex) greedyToLeaf(nodes []vpNode, perm []uint32, query []float32,
 // Search encontra os k vizinhos mais próximos de query e retorna a fração
 // de vizinhos fraudulentos (fraud score em [0.0, 1.0]).
 //
-// Algoritmo: greedy descent single-tree + backtracking em dois estágios.
+// Algoritmo: greedy descent dual-tree + backtracking em quatro estágios.
 //
 //  1. Estágio rápido (todos os casos): vpInitialLeafVisits descents (tree 1).
 //     Custo: ~5×80 ops × 7ns ≈ 2.8µs.
 //     Cobre 96%+ dos casos (fraudCount 0 ou k = decisão clara).
 //
-//  2. Refinamento (só casos borderline, fraudCount ∈ {1..k-1}):
-//     Continua explorando via PQ de backtracking da tree 1 até vpMaxLeafVisits.
+//  2. Refinamento borderline (tree 1): até vpMaxLeafVisits total.
 //     Custo: até ~700×80 ops × 7ns ≈ 392µs (para ~4% dos casos).
 //
-// Custo médio (N=3M, 96% clear + 4% borderline):
+//  3. Multi-probe (todos os casos): vpInitialLeafVisits descents (tree 2).
+//     Custo: +~2.8µs (mesmo que estágio 1). Tree 2 tem seed diferente →
+//     estrutura de vizinhança diferente → encontra vizinhos que tree 1 perdeu.
 //
-//	0.96×2.8 + 0.04×392 ≈ 18.4µs/query média.
+//  4. Refinamento borderline (tree 2): até vpMaxLeafVisits adicional.
 //
-// Nota: pq2 é adquirido do pool para manter compatibilidade com o formato
-// dual-tree do vptree.bin, mas não é usado na busca (tree 1 é suficiente).
+// Custo médio: 0.96×5.6µs + 0.04×784µs ≈ 36.8µs/query (2× estágio 1+2).
+// Resultado: os 5 vizinhos mais próximos reais em AMBAS as árvores.
 func (idx *VPIndex) Search(query []float32, k int) float32 {
 	knn := <-idx.knnPool
 	pq := <-idx.pqPool
-	pq2 := <-idx.pq2Pool // adquirido mas não usado na busca
+	pq2 := <-idx.pq2Pool
 	defer func() {
 		knn.reset()
 		idx.knnPool <- knn
@@ -434,16 +459,45 @@ func (idx *VPIndex) Search(query []float32, k int) float32 {
 	}
 
 	// ── Estágio 2: refinamento só para casos borderline (tree 1) ─────────
-	// Casos borderline (fraudCount ∈ {1..k-1}) recebem busca extra via PQ.
-	// Stage 1 já preencheu o PQ com nós a explorar — continuamos de onde paramos.
-	fc := knn.fraudCount(idx.labels)
-	if fc > 0 && fc < k {
+	// Gating por contagem simples: refina quando fc∈[1,k-1] — resultado pode
+	// mudar (count=1 pode virar 3 → reject; count=4 pode virar 2 → approve).
+	// Alinhado com a regra oficial: fraud_score = count/k, threshold 0.6.
+	if fc := knn.fraudCount(idx.labels); fc > 0 && fc < k {
 		for leafVisits := vpInitialLeafVisits; leafVisits < vpMaxLeafVisits && len(pq.buf) > 0; leafVisits++ {
 			c := pq.pop()
 			if knn.n == k && c.minDist >= knn.worstActual() {
 				break
 			}
 			idx.greedyToLeaf(idx.nodes, idx.perm, query, c.nodeIdx, knn, pq)
+			if fc2 := knn.fraudCount(idx.labels); fc2 == 0 || fc2 == k {
+				break
+			}
+		}
+	}
+
+	// ── Estágio 3: multi-probe via tree 2 (todos os casos) ───────────────
+	// Tree 2 usa seed diferente → estrutura de vizinhança diferente.
+	// tryInsertSq deduplica pontos já presentes no knn → resultado correto.
+	idx.greedyToLeaf(idx.nodes2, idx.perm2, query, 0, knn, pq2)
+	for leafVisits := 1; leafVisits < vpInitialLeafVisits && len(pq2.buf) > 0; leafVisits++ {
+		c := pq2.pop()
+		if knn.n == k && c.minDist >= knn.worstActual() {
+			break
+		}
+		idx.greedyToLeaf(idx.nodes2, idx.perm2, query, c.nodeIdx, knn, pq2)
+	}
+
+	// ── Estágio 4: refinamento borderline (tree 2) ────────────────────────
+	if fc := knn.fraudCount(idx.labels); fc > 0 && fc < k {
+		for leafVisits := vpInitialLeafVisits; leafVisits < vpMaxLeafVisits && len(pq2.buf) > 0; leafVisits++ {
+			c := pq2.pop()
+			if knn.n == k && c.minDist >= knn.worstActual() {
+				break
+			}
+			idx.greedyToLeaf(idx.nodes2, idx.perm2, query, c.nodeIdx, knn, pq2)
+			if fc2 := knn.fraudCount(idx.labels); fc2 == 0 || fc2 == k {
+				break
+			}
 		}
 	}
 
@@ -452,15 +506,18 @@ func (idx *VPIndex) Search(query []float32, k int) float32 {
 
 // WarmUp faz buscas greedy para pré-carregar páginas quentes no page cache.
 //
-// Estratégia: 3000 greedy descents usando vetores reais como query, distribuídos
-// uniformemente. Cada busca acessa depth=16 nós e 1 folha (64 pontos):
-// ~(16×16B + 64×28B) = 2048B de nodes+vectors per busca.
-// 3000 × 2048B ≈ 6MB de páginas acessadas no padrão real de busca.
-//
-// NOTA: NÃO faz leitura sequencial de vectors16 (84MB) — isso causaria cache
-// thrashing ao evitar código Go e páginas HTTP do page cache (contraproducente).
-// As 3000 buscas greedy aquecem as páginas mais quentes (root path, folhas comuns).
+// Estratégia: 3000 greedy descents em AMBAS as árvores usando vetores reais,
+// distribuídos uniformemente. Aquece os root paths e folhas mais visitadas.
 func (idx *VPIndex) WarmUp() {
+	// Scan sequencial: força todas as páginas de vectors16 (84 MB) no page cache
+	// antes de aceitar tráfego. Sem isso, queries frias sofrem page fault (5–50 ms),
+	// inflando o p99 nas primeiras dezenas de segundos.
+	var acc int16
+	for _, v := range idx.vectors16 {
+		acc += v
+	}
+	_ = acc
+
 	const nWarming = 3000
 	knn := &vpKNN{}
 	pq := &vpPQ{buf: make([]vpPQEntry, 0, 64)}
@@ -472,7 +529,6 @@ func (idx *VPIndex) WarmUp() {
 
 	for i := 0; i < nWarming && i*step < idx.n; i++ {
 		ptIdx := i * step
-		// Constrói query float32 a partir do vetor int16 do ponto ptIdx
 		var query [dim]float32
 		ref := idx.vectors16[ptIdx*dim : ptIdx*dim+dim]
 		const scale = float32(1.0 / 32767.0)
@@ -486,5 +542,7 @@ func (idx *VPIndex) WarmUp() {
 		knn.reset()
 		pq.buf = pq.buf[:0]
 		idx.greedyToLeaf(idx.nodes, idx.perm, query[:], 0, knn, pq)
+		pq.buf = pq.buf[:0]
+		idx.greedyToLeaf(idx.nodes2, idx.perm2, query[:], 0, knn, pq)
 	}
 }

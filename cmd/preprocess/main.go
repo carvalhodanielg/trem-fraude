@@ -355,7 +355,13 @@ func main() {
 	stat, _ := os.Stat(output)
 	log.Printf("índice HNSW salvo: %s (%.1f MB)", output, float64(stat.Size())/1024/1024)
 
-	// ── Fase 4: Construir dual VP-Tree e escrever vptree.bin ─────────────
+	// ── Fase 4: Construir dual VP-Tree e escrever vptree.bin ────────────
+	// IMPORTANTE: os vetores de referência são usados COMO PUBLICADOS (v[4] =
+	// day_of_week). O gabarito do teste é 5-NN exato sobre esses mesmos vetores
+	// (AVALIACAO.md), e a query em vectorize.go emite day_of_week em v[4].
+	// Qualquer transformação de feature aqui (ex.: velocidade) muda o espaço
+	// métrico e desalinha do gabarito → explosão de FP/FN. NÃO transformar.
+	//
 	// Duas árvores com seeds diferentes exploram regiões diferentes do espaço.
 	// Para casos borderline (k-NN mistos), a árvore 2 cobre subtrees que a árvore 1
 	// não alcança com o mesmo orçamento de busca → ~30-50% menos failures.
