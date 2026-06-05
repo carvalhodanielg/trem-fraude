@@ -22,6 +22,13 @@ services:
       - GOMAXPROCS=1
       - GOMEMLIMIT=145MiB
       - GOGC=100  # NÃO usar off: heap inflava ~113MB e despejava o índice mmap → reclaim direto → p99 estourava. Diag cgroup: p99 4895ms→2ms com GC ligado.
+    # memlock ilimitado: permite mlock(2) do índice (~115MB) sem CAP_SYS_RESOURCE.
+    # Sem isto o default do Docker (64KB) faz o mlock falhar → fallback p/ prefault
+    # despejável. Pinar as páginas mata a cauda de p99 (major fault impossível).
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     healthcheck:
       test: [ "CMD", "wget", "-qO-", "http://localhost:8080/ready" ]
       interval: 2s
@@ -40,6 +47,13 @@ services:
       - GOMAXPROCS=1
       - GOMEMLIMIT=145MiB
       - GOGC=100  # NÃO usar off: heap inflava ~113MB e despejava o índice mmap → reclaim direto → p99 estourava. Diag cgroup: p99 4895ms→2ms com GC ligado.
+    # memlock ilimitado: permite mlock(2) do índice (~115MB) sem CAP_SYS_RESOURCE.
+    # Sem isto o default do Docker (64KB) faz o mlock falhar → fallback p/ prefault
+    # despejável. Pinar as páginas mata a cauda de p99 (major fault impossível).
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     healthcheck:
       test: [ "CMD", "wget", "-qO-", "http://localhost:8080/ready" ]
       interval: 2s

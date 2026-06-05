@@ -37,3 +37,28 @@ func mmapReadOnly(path string) ([]byte, error) {
 	}
 	return data, nil
 }
+
+// raiseMemlockLimit eleva RLIMIT_MEMLOCK ao máximo possível para que o mlock do
+// índice (~115 MB) não bata no default do Docker (64 KB). Tenta infinito primeiro
+// (exige CAP_SYS_RESOURCE); se não der, sobe o soft até o hard atual. Best-effort.
+func raiseMemlockLimit() error {
+	inf := unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY}
+	if err := unix.Setrlimit(unix.RLIMIT_MEMLOCK, &inf); err == nil {
+		return nil
+	}
+	var cur unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &cur); err != nil {
+		return err
+	}
+	cur.Cur = cur.Max
+	return unix.Setrlimit(unix.RLIMIT_MEMLOCK, &cur)
+}
+
+// lockResident pina as páginas de data na RAM via mlock(2): o kernel não pode
+// despejá-las sob pressão do cgroup, então major fault no caminho de busca vira
+// impossível — mata a cauda de p99 na raiz. mlock também faulta tudo de forma
+// síncrona (substitui o prefault). Best-effort: devolve erro se RLIMIT_MEMLOCK
+// for baixo ou faltar privilégio, e o chamador segue com o prefault sequencial.
+func lockResident(data []byte) error {
+	return unix.Mlock(data)
+}

@@ -519,6 +519,28 @@ func (idx *VPIndex) WarmUp() {
 	// fault (5–50 ms) → cauda de p99 ~164 ms. O scan só de vectors16 + 3000
 	// descents tocava ~3% de perm, deixando o resto frio. (MADV_WILLNEED é
 	// prefetch assíncrono e despejável — não substitui o fault síncrono.)
+	//
+	// Estratégia preferida: mlock(2). Pina vptree.bin (~112 MB) + labels (~3 MB)
+	// na RAM → o kernel NÃO pode despejá-los sob pressão do cgroup de 170 MB, logo
+	// major fault no caminho de busca vira impossível (não só "esquentado" e
+	// despejável como o prefault). mlock também faulta tudo de forma síncrona, então
+	// dispensa o scan. Working set fixado ≈115 MB < 170 MB → cabe com folga.
+	// Best-effort: em Docker o default de RLIMIT_MEMLOCK é 64 KB; se a elevação e o
+	// mlock falharem, caímos no scan sequencial (prefault despejável, mas melhor que
+	// páginas frias).
+	if err := raiseMemlockLimit(); err != nil {
+		log.Printf("warm-up: não consegui elevar RLIMIT_MEMLOCK (%v) — seguindo", err)
+	}
+	lockErr := lockResident(idx.mmapTree)
+	if lockErr == nil {
+		lockErr = lockResident(idx.labels)
+	}
+	if lockErr == nil {
+		log.Printf("warm-up: índice pinado na RAM via mlock (%d MB tree + labels)", len(idx.mmapTree)>>20)
+		return
+	}
+	log.Printf("warm-up: mlock falhou (%v) — fallback para prefault sequencial", lockErr)
+
 	const pageSize = 4096
 	var acc byte
 	for i := 0; i < len(idx.mmapTree); i += pageSize {
