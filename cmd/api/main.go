@@ -91,9 +91,11 @@ func startup() {
 		log.Fatalf("erro ao carregar índice VP-Tree: %v", err)
 	}
 
-	// Warm-up tardio: aguarda 57s para manter pages quentes na janela do teste.
-	log.Println("aguardando warm-up tardio (57s)...")
-	time.Sleep(57 * time.Second)
+	// Warm-up imediato: toca as páginas do índice mmap assim que carrega.
+	// (O sleep de 57s anterior atrasava a readiness além do timeout de
+	// dependências do harness da rinha → submissão falhava inteira. O motivo
+	// original do warm-up tardio — eviction do índice mmap — já foi resolvido
+	// por GOGC=100, que mantém o heap pequeno e o índice residente.)
 	t0 := time.Now()
 	idx.WarmUp()
 	log.Printf("warm-up concluído em %s", time.Since(t0))
