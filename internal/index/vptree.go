@@ -509,12 +509,20 @@ func (idx *VPIndex) Search(query []float32, k int) float32 {
 // Estratégia: 3000 greedy descents em AMBAS as árvores usando vetores reais,
 // distribuídos uniformemente. Aquece os root paths e folhas mais visitadas.
 func (idx *VPIndex) WarmUp() {
-	// Scan sequencial: força todas as páginas de vectors16 (84 MB) no page cache
-	// antes de aceitar tráfego. Sem isso, queries frias sofrem page fault (5–50 ms),
-	// inflando o p99 nas primeiras dezenas de segundos.
-	var acc int16
-	for _, v := range idx.vectors16 {
-		acc += v
+	// Scan sequencial do vptree.bin INTEIRO (nodes1+perm1+nodes2+perm2+vectors16,
+	// ~112 MB) tocando 1 byte por página (4 KB). Faulta TODAS as páginas no page
+	// cache antes de aceitar tráfego — não só vectors16.
+	//
+	// Por que o tree inteiro e não só vectors16: as queries borderline (~4%) fazem
+	// busca refinada de até 300 folhas, com milhares de leituras ALEATÓRIAS de
+	// perm/perm2 (24 MB). Se essas páginas ficam frias, cada acesso vira major
+	// fault (5–50 ms) → cauda de p99 ~164 ms. O scan só de vectors16 + 3000
+	// descents tocava ~3% de perm, deixando o resto frio. (MADV_WILLNEED é
+	// prefetch assíncrono e despejável — não substitui o fault síncrono.)
+	const pageSize = 4096
+	var acc byte
+	for i := 0; i < len(idx.mmapTree); i += pageSize {
+		acc += idx.mmapTree[i]
 	}
 	_ = acc
 
